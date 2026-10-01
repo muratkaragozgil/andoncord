@@ -22,6 +22,9 @@ final class AppState {
     /// statusline cache in `BoardStore` is the fallback for machines without
     /// the desktop app.
     let planUsage = PlanUsageStore()
+    /// Quota asked of Anthropic directly — exact, and opt-in, because it is
+    /// the one source that leaves the Mac.
+    let anthropicUsage = AnthropicUsageStore()
     let settings = AndonSettings()
     let installer = ClaudeSettingsInstaller()
     let codexInstaller = CodexHooksInstaller()
@@ -62,12 +65,18 @@ final class AppState {
     init() {
         board.onSound = { [weak self] sound in self?.playSound(sound) }
         board.onQuotaSample = { [weak self] snapshot in self?.calibrate(against: snapshot) }
+        anthropicUsage.onReading = { [weak self] limits, at in
+            self?.calibrate(limits: limits, capturedAt: at)
+        }
         // The reading that lands at launch is paired against whatever the
         // index held at that instant, which on a first run is nothing. Every
         // completed pass is a chance to do that pairing properly.
         ledger.onIndexed = { [weak self] in
             guard let self else { return }
             if let status = self.board.status { self.calibrate(against: status) }
+            if let limits = self.anthropicUsage.limits, let at = self.anthropicUsage.fetchedAt {
+                self.calibrate(limits: limits, capturedAt: at)
+            }
             self.calibrateAgainstPlanRecord()
         }
     }
@@ -90,21 +99,24 @@ final class AppState {
         var indexedAt: Date?
         var planReadAt: Date?
         var capturedAt: Date?
+        var fetchedAt: Date?
         var tick: Int
     }
 
     /// The best available figure for one window, and an honest label for where
     /// it came from.
     ///
-    /// Three sources, in descending order of how much they can be trusted:
-    /// the desktop app's five-minute record, the statusline cache, and — only
-    /// when both have gone quiet — spend measured from the transcripts scaled
-    /// against whatever real reading was seen last.
+    /// Four sources, in descending order of how much they can be trusted:
+    /// Anthropic itself when exact usage is on, the desktop app's record, the
+    /// statusline cache, and — only when all of those have gone quiet — spend
+    /// measured from the transcripts scaled against whatever real reading was
+    /// seen last.
     func quotaReadout(_ kind: QuotaWindowKind, now: Date = Date()) -> QuotaReadout {
         let key = ReadoutKey(
             indexedAt: ledger.indexedAt,
             planReadAt: planUsage.readAt,
             capturedAt: board.status?.capturedAt,
+            fetchedAt: anthropicUsage.fetchedAt,
             tick: Int(now.timeIntervalSinceReferenceDate / 15))
         if let cached = readoutCache[kind], cached.key == key { return cached.value }
         let readout = computeQuotaReadout(kind, now: now)
@@ -114,6 +126,31 @@ final class AppState {
 
     private func computeQuotaReadout(_ kind: QuotaWindowKind, now: Date) -> QuotaReadout {
         let spent = ledger.total(since: windowStart(kind, now: now))
+
+        // Anthropic's own figure, unless the desktop record has something
+        // newer. It goes through the composer like any reading, so one that
+        // stops arriving is carried forward rather than frozen.
+        if let limits = anthropicUsage.limits, let at = anthropicUsage.fetchedAt,
+           at >= planUsage.latest?.at ?? .distantPast {
+            if limits.window(kind) != nil {
+                return QuotaReadout.compose(
+                    kind: kind,
+                    inputs: .init(
+                        limits: limits,
+                        capturedAt: at,
+                        isStale: !anthropicUsage.isFresh,
+                        spentInWindow: spent,
+                        spentSinceReading: ledger.total(since: at),
+                        calibration: calibration,
+                        samples: quotaSamples(for: kind)),
+                    now: now)
+            }
+            // A current answer without the window means none is open —
+            // nothing sent since the last one lapsed. The older sources could
+            // only get that wrong.
+            if anthropicUsage.isFresh { return QuotaReadout(kind: kind, spent: spent) }
+        }
+
         if let plan = planUsage.readout(kind, spent: spent, now: now) {
             // The desktop app only polls while its usage tray has been opened
             // in the last day, so its record can stop for hours with the app
@@ -153,7 +190,11 @@ final class AppState {
 
     /// When the window currently in force opened, for scoping spend to it.
     func windowStart(_ kind: QuotaWindowKind, now: Date = Date()) -> Date {
-        planUsage.windowStart(kind, now: now)
+        // Anthropic states the reset outright; everything else infers it.
+        if let resetsAt = anthropicUsage.limits?.window(kind)?.resetsAt, resetsAt > now {
+            return resetsAt.addingTimeInterval(-kind.length)
+        }
+        return planUsage.windowStart(kind, now: now)
             ?? kind.windowStart(limits: board.rateLimits, now: now)
     }
 
@@ -186,16 +227,22 @@ final class AppState {
     /// is clipped at `capturedAt`.
     private func calibrate(against snapshot: StatusSnapshot) {
         guard let limits = snapshot.rateLimits else { return }
+        calibrate(limits: limits, capturedAt: snapshot.capturedAt)
+    }
+
+    /// The same for any reading that states its reset times — the statusline
+    /// and Anthropic's endpoint both do.
+    private func calibrate(limits: RateLimits, capturedAt: Date) {
         var updated = calibration
         for kind in QuotaWindowKind.allCases {
             guard let window = limits.window(kind) else { continue }
-            let end = min(window.resetsAt ?? snapshot.capturedAt, snapshot.capturedAt)
-            let start = (window.resetsAt ?? snapshot.capturedAt)
+            let end = min(window.resetsAt ?? capturedAt, capturedAt)
+            let start = (window.resetsAt ?? capturedAt)
                 .addingTimeInterval(-kind.length)
             guard start < end else { continue }
             updated.observe(
                 kind: kind, usedPercentage: window.usedPercentage,
-                spent: ledger.total(in: start..<end), at: snapshot.capturedAt)
+                spent: ledger.total(in: start..<end), at: capturedAt)
         }
         guard updated != calibration else { return }
         calibration = updated
@@ -242,6 +289,12 @@ final class AppState {
         updated.save()
     }
 
+    /// Starts or stops asking Anthropic to match the setting. Called at
+    /// launch and whenever the toggle moves.
+    func applyExactUsage() {
+        if settings.exactUsage { anthropicUsage.start() } else { anthropicUsage.stop() }
+    }
+
     // MARK: - Lifecycle
 
     func start() {
@@ -281,6 +334,7 @@ final class AppState {
         // someone wait when they open the window.
         ledger.start()
         planUsage.start()
+        applyExactUsage()
         board.startWatchingRateLimits()
         // Sessions whose process died without a SessionEnd would otherwise sit
         // on the board reading "running" indefinitely.
@@ -297,6 +351,7 @@ final class AppState {
 
     func stop() {
         planUsage.stop()
+        anthropicUsage.stop()
         ledger.stop()
         board.stopReaping()
         server.stop()

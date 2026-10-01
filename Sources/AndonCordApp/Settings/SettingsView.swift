@@ -512,6 +512,16 @@ struct SettingsView: View {
                     detail: "The 5-hour and weekly windows, read from the Claude desktop app's own record — or Claude Code's statusline — and carried forward by measured spend between readings.",
                     isOn: bind(\.showUsage))
                 RowDivider()
+                ToggleRow(
+                    "Exact usage from Anthropic",
+                    detail: exactUsageDetail,
+                    isOn: Binding(
+                        get: { app.settings.exactUsage },
+                        set: {
+                            app.settings.exactUsage = $0
+                            app.applyExactUsage()
+                        }))
+                RowDivider()
                 usageRow
                 RowDivider()
                 ToggleRow(
@@ -519,6 +529,41 @@ struct SettingsView: View {
                     detail: nil,
                     isOn: bind(\.launchAtLogin))
             }
+        }
+    }
+
+    /// What exact usage does, and — once it is on — whether it is working,
+    /// since a source that has quietly stopped looks exactly like one that
+    /// is fine.
+    private var exactUsageDetail: String {
+        let what = "Asks Anthropic every five minutes, signed in as Claude Code (its token is read from the Keychain). The only thing AndonCord sends off this Mac."
+        guard app.settings.exactUsage else { return what }
+        let usage = app.anthropicUsage
+        if let problem = usage.problem {
+            return what + " · " + Self.describe(problem)
+        }
+        guard let fetchedAt = usage.fetchedAt else { return what + " · Checking…" }
+        let minutes = Int(Date().timeIntervalSince(fetchedAt) / 60)
+        return what + " · Updated " + (minutes < 1 ? "just now" : "\(minutes)m ago")
+    }
+
+    private static func describe(_ problem: AnthropicUsageStore.Problem) -> String {
+        switch problem {
+        case .notSignedIn:
+            return "Claude Code isn't signed in on this Mac — run claude once."
+        case .missingScope:
+            return "Claude Code's token can't read usage. Sign in with `claude` rather than `claude setup-token`."
+        case .signInExpired:
+            return "Claude Code's sign-in has expired and couldn't be renewed — run claude once."
+        case .rateLimited(let until):
+            let minutes = max(1, Int(until.timeIntervalSinceNow / 60))
+            return "Anthropic asked to slow down; trying again in \(minutes)m."
+        case .rejected(let status):
+            return "Anthropic refused the request (HTTP \(status))."
+        case .unreachable:
+            return "Couldn't reach Anthropic."
+        case .unreadableResponse:
+            return "Anthropic's answer wasn't in a shape this build understands."
         }
     }
 

@@ -12,6 +12,7 @@ public enum Log {
     public static let install = Logger(subsystem: subsystem, category: "install")
     public static let ui = Logger(subsystem: subsystem, category: "ui")
     public static let jump = Logger(subsystem: subsystem, category: "jump")
+    public static let usage = Logger(subsystem: subsystem, category: "usage")
 
     /// `ANDON_DEBUG=1` mirrors everything to a file, because `log stream` is
     /// awkward to use when you are debugging a hook that runs inside someone

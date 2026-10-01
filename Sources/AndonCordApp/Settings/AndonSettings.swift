@@ -17,6 +17,7 @@ final class AndonSettings {
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let quietWhileFocused = "quietWhileFocused"
         static let migratedAlwaysVisiblePill = "migratedAlwaysVisiblePill"
+        static let exactUsage = "exactUsageFromAnthropic"
     }
 
     private let defaults: UserDefaults
@@ -35,6 +36,7 @@ final class AndonSettings {
             Key.hideWhenIdle: false,
             Key.hasCompletedOnboarding: false,
             Key.quietWhileFocused: true,
+            Key.exactUsage: false,
         ])
 
         // One-time migration for installs that predate the new default. A
@@ -70,6 +72,17 @@ final class AndonSettings {
     var showUsage: Bool {
         get { defaults.bool(forKey: Key.showUsage) }
         set { defaults.set(newValue, forKey: Key.showUsage) }
+    }
+
+    /// Ask Anthropic for the quota instead of inferring it.
+    ///
+    /// Off by default because it is the one thing AndonCord does over the
+    /// network: Claude Code's sign-in token, read from the Keychain, sent to
+    /// Anthropic's usage endpoint every five minutes. Everything else stays
+    /// on the Mac whichever way this is set.
+    var exactUsage: Bool {
+        get { defaults.bool(forKey: Key.exactUsage) }
+        set { defaults.set(newValue, forKey: Key.exactUsage) }
     }
 
     /// Which display the board lives on, by `localizedName`. `nil` means
