@@ -174,6 +174,19 @@ public struct SessionUsage: Codable, Sendable, Identifiable, Equatable {
     public var costliestFootprints: [ContextFootprint] {
         footprints.sorted { $0.totalTokens > $1.totalTokens }
     }
+
+    /// Fold a subagent's spend into the session that spawned it: its usage,
+    /// its hours and its models, but not its turns — the subagent's opening
+    /// message is the brief it was handed, not a prompt anyone typed.
+    public mutating func absorb(_ subagent: SessionUsage) {
+        usage += subagent.usage
+        var hours = Dictionary(hourly.map { ($0.hour, $0.usage) }, uniquingKeysWith: +)
+        for bucket in subagent.hourly { hours[bucket.hour, default: TokenUsage()] += bucket.usage }
+        hourly = hours.map { HourBucket(hour: $0.key, usage: $0.value) }
+        startedAt = min(startedAt, subagent.startedAt)
+        lastActivityAt = max(lastActivityAt, subagent.lastActivityAt)
+        for model in subagent.models where !models.contains(model) { models.append(model) }
+    }
 }
 
 /// Everything one project burned, across all its sessions.

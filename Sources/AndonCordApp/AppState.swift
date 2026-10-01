@@ -66,8 +66,9 @@ final class AppState {
         // index held at that instant, which on a first run is nothing. Every
         // completed pass is a chance to do that pairing properly.
         ledger.onIndexed = { [weak self] in
-            guard let self, let status = self.board.status else { return }
-            self.calibrate(against: status)
+            guard let self else { return }
+            if let status = self.board.status { self.calibrate(against: status) }
+            self.calibrateAgainstPlanRecord()
         }
     }
 
@@ -195,6 +196,46 @@ final class AppState {
             updated.observe(
                 kind: kind, usedPercentage: window.usedPercentage,
                 spent: ledger.total(in: start..<end), at: snapshot.capturedAt)
+        }
+        guard updated != calibration else { return }
+        calibration = updated
+        updated.save()
+    }
+
+    /// The same, against the desktop app's record.
+    ///
+    /// The statusline fires only while a terminal session draws one, so on a
+    /// machine worked mostly through the desktop app the scale could sit for
+    /// days on one old reading — long enough for the mix of models, and how
+    /// much of the work runs in subagents, to have moved under it. The record
+    /// is a reading every fifteen minutes whatever the work runs in. Every
+    /// sample newer than the last one folded in is replayed in order, each
+    /// paired with the spend from the start of its own window to the moment
+    /// it was taken.
+    private func calibrateAgainstPlanRecord() {
+        let samples = planUsage.samples
+        var updated = calibration
+        for kind in QuotaWindowKind.allCases {
+            let since = updated.date(for: kind) ?? .distantPast
+            for (index, sample) in samples.enumerated() where sample.at > since {
+                guard let used = sample.value(for: kind) else { continue }
+                // Only what the record knew at the time: the five-hour window
+                // is dated from the latest reset, which must not be a later one.
+                let known = Array(samples[...index])
+                guard let resetsAt = PlanUsageFile.resetsAt(
+                    for: kind, samples: known, now: sample.at)
+                else { continue }
+                var start = resetsAt.addingTimeInterval(-kind.length)
+                // An off-cycle reset zeroes the figure without moving the
+                // cadence, and nothing spent before it is in the percentage.
+                if let dropped = PlanUsageFile.resets(for: kind, samples: known).last?.instant {
+                    start = max(start, dropped)
+                }
+                guard start < sample.at else { continue }
+                updated.observe(
+                    kind: kind, usedPercentage: used,
+                    spent: ledger.total(in: start..<sample.at), at: sample.at)
+            }
         }
         guard updated != calibration else { return }
         calibration = updated

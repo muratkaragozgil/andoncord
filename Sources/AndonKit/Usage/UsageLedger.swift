@@ -85,9 +85,7 @@ public final class UsageLedger {
         if sessions.isEmpty { isIndexing = true }
         let result = await Self.reindex(known: known)
         cache = result.entries
-        sessions = result.entries.values
-            .compactMap(\.session)
-            .sorted { $0.lastActivityAt > $1.lastActivityAt }
+        sessions = Self.assemble(result.entries.values)
         failure = result.failure
         isIndexing = false
         indexedAt = Date()
@@ -219,6 +217,70 @@ public final class UsageLedger {
         var size: Int
         var modified: Date
         var session: SessionUsage?
+        /// A subagent's own transcript, billed to the session that spawned it.
+        /// Optional so an index written before subagents were counted still
+        /// decodes; everything in it was a top-level transcript.
+        var isSubagent: Bool?
+    }
+
+    /// One row per conversation, with every subagent it spawned folded in.
+    ///
+    /// The parent's own transcript supplies the title, the prompts and the
+    /// footprints; a subagent adds its spend and nothing else, because its
+    /// "prompt" is the brief it was handed, not something anyone typed.
+    nonisolated static func assemble(_ entries: some Sequence<IndexEntry>) -> [SessionUsage] {
+        var byId: [String: SessionUsage] = [:]
+        var subagents: [SessionUsage] = []
+        for entry in entries {
+            guard let session = entry.session else { continue }
+            if entry.isSubagent == true {
+                subagents.append(session)
+            } else {
+                byId[session.id] = session
+            }
+        }
+        for subagent in subagents {
+            if var parent = byId[subagent.id] {
+                parent.absorb(subagent)
+                byId[subagent.id] = parent
+            } else {
+                // The parent transcript is gone but the spend still happened.
+                byId[subagent.id] = subagent
+            }
+        }
+        return byId.values.sorted { $0.lastActivityAt > $1.lastActivityAt }
+    }
+
+    /// Every transcript under one project directory, and the session each one
+    /// bills to.
+    ///
+    /// Subagents do not write into their parent's transcript. Each one — and
+    /// every agent a workflow fans out — gets its own file under
+    /// `<session>/subagents/`, and on a day of workflows that is most of the
+    /// spend: reading only the top level once had the board at half the
+    /// weekly figure Claude itself was showing.
+    private nonisolated static func transcripts(
+        in directory: URL
+    ) -> [(url: URL, sessionId: String, isSubagent: Bool)] {
+        let fm = FileManager.default
+        let children = (try? fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        var found: [(url: URL, sessionId: String, isSubagent: Bool)] = []
+        for child in children {
+            if child.pathExtension == "jsonl" {
+                found.append((child, child.deletingPathExtension().lastPathComponent, false))
+                continue
+            }
+            let subagents = child.appendingPathComponent("subagents")
+            guard let walker = fm.enumerator(
+                at: subagents, includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles])
+            else { continue }
+            for case let file as URL in walker where file.pathExtension == "jsonl" {
+                found.append((file, child.lastPathComponent, true))
+            }
+        }
+        return found
     }
 
     private struct ReindexResult: Sendable {
@@ -246,13 +308,13 @@ public final class UsageLedger {
             }
 
             var entries: [String: IndexEntry] = [:]
-            var stale: [(path: String, url: URL, size: Int, modified: Date)] = []
+            var stale: [(
+                path: String, url: URL, sessionId: String, isSubagent: Bool,
+                size: Int, modified: Date
+            )] = []
 
             for directory in projectDirs {
-                let files = (try? FileManager.default.contentsOfDirectory(
-                    at: directory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
-                )) ?? []
-                for file in files where file.pathExtension == "jsonl" {
+                for (file, sessionId, isSubagent) in transcripts(in: directory) {
                     let values = try? file.resourceValues(
                         forKeys: [.fileSizeKey, .contentModificationDateKey])
                     let size = values?.fileSize ?? 0
@@ -262,7 +324,7 @@ public final class UsageLedger {
                        cached.size == size, cached.modified == modified {
                         entries[file.path] = cached
                     } else {
-                        stale.append((file.path, file, size, modified))
+                        stale.append((file.path, file, sessionId, isSubagent, size, modified))
                     }
                 }
             }
@@ -276,10 +338,10 @@ public final class UsageLedger {
                     for item in stale {
                         group.addTask {
                             let session = TranscriptScanner.scan(
-                                file: item.url,
-                                sessionId: item.url.deletingPathExtension().lastPathComponent)
+                                file: item.url, sessionId: item.sessionId)
                             return (item.path, IndexEntry(
-                                size: item.size, modified: item.modified, session: session))
+                                size: item.size, modified: item.modified, session: session,
+                                isSubagent: item.isSubagent))
                         }
                     }
                     var results: [String: IndexEntry] = [:]
@@ -314,9 +376,7 @@ public final class UsageLedger {
               file.version == Self.cacheVersion
         else { return }
         cache = file.entries
-        sessions = file.entries.values
-            .compactMap(\.session)
-            .sorted { $0.lastActivityAt > $1.lastActivityAt }
+        sessions = Self.assemble(file.entries.values)
     }
 
     private func saveCache() {

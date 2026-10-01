@@ -19,8 +19,9 @@ import Observation
 ///     13:44  fh  1%     ← new one, so it opened in between
 ///
 /// which puts the five-hour window's reset at 18:44. The weekly window resets
-/// on a fixed weekly cadence, so every reset ever recorded constrains the same
-/// phase — the tightest bracket across a month pins it to a few minutes.
+/// on a fixed weekly cadence, so every on-cadence reset ever recorded
+/// constrains the same phase — intersected across a month, they pin it to a
+/// few minutes.
 ///
 /// The file is read; nothing is ever written back to it.
 @Observable
@@ -187,10 +188,11 @@ public enum PlanUsageFile {
     /// The two windows need different reasoning, because only one of them is
     /// periodic:
     ///
-    /// * **Weekly** resets on a fixed cadence, so every reset ever recorded is
-    ///   evidence about the same phase. The tightest bracket wins and is
-    ///   projected forward in whole weeks — a month of history normally pins
-    ///   it to a few minutes.
+    /// * **Weekly** resets on a fixed cadence, so every on-cadence reset is
+    ///   evidence about the same phase. Their brackets are intersected (see
+    ///   `weeklyPhase` for telling them from off-cycle ones) and projected
+    ///   forward in whole weeks — a month of history normally pins it to a few
+    ///   minutes.
     /// * **Five-hour** windows open on the first request after the previous
     ///   one lapsed, so they are not on a grid at all and only the most recent
     ///   reset says anything. Its bracket is as good as the sampling was
@@ -203,8 +205,8 @@ public enum PlanUsageFile {
 
         switch kind {
         case .sevenDay:
-            guard let tightest = found.min(by: { $0.span < $1.span }) else { return nil }
-            var candidate = tightest.instant.addingTimeInterval(kind.length)
+            guard let phase = weeklyPhase(found, period: kind.length) else { return nil }
+            var candidate = phase.instant.addingTimeInterval(kind.length)
             // Project forward in whole windows. Bounded rather than `while
             // true` so a corrupt timestamp cannot spin here.
             let steps = Int(max(0, now.timeIntervalSince(candidate)) / kind.length) + 1
@@ -228,5 +230,44 @@ public enum PlanUsageFile {
             // report.
             return resetsAt > now ? resetsAt : nil
         }
+    }
+
+    /// The weekly cadence, as the bracket the on-cadence resets agree on.
+    ///
+    /// Not every drop is the cadence. A limit can be reset off-cycle — a plan
+    /// change, a reset from Anthropic's side — and one such landed a tidy
+    /// fifteen-minute bracket at Tuesday noon which, as the tightest bracket on
+    /// record, dragged every projected reset a day and five hours early. The
+    /// cadence itself never moved; the next reset came on Wednesday as usual.
+    ///
+    /// So resets vote. Each one gathers every other whose bracket overlaps it
+    /// modulo a week, the largest group wins (the latest, on a tie), and the
+    /// group's brackets are intersected, since the true reset sat inside every
+    /// one of them. A wide bracket simply agrees with everything and narrows
+    /// nothing.
+    static func weeklyPhase(_ resets: [Reset], period: TimeInterval) -> Reset? {
+        func aligned(_ reset: Reset, to anchor: Reset) -> Reset {
+            let weeks = (anchor.instant.timeIntervalSince(reset.instant) / period).rounded()
+            return Reset(
+                before: reset.before.addingTimeInterval(weeks * period),
+                after: reset.after.addingTimeInterval(weeks * period))
+        }
+
+        var best: [Reset] = []
+        for candidate in resets {
+            let group = resets
+                .map { aligned($0, to: candidate) }
+                .filter { $0.before <= candidate.after && candidate.before <= $0.after }
+            // Resets arrive in order, so `>=` lets the latest win a tie.
+            if group.count >= best.count { best = group }
+        }
+        guard !best.isEmpty else { return nil }
+
+        let before = best.map(\.before).max()!
+        let after = best.map(\.after).min()!
+        if before <= after { return Reset(before: before, after: after) }
+        // Each overlaps the candidate but not necessarily each other, and the
+        // tightest single bracket is then the most that can be said.
+        return best.min { $0.span < $1.span }
     }
 }

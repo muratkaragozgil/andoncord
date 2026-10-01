@@ -26,14 +26,19 @@ final class UsageLedgerTests: XCTestCase {
     }
 
     /// Writes a transcript with one response per hour, counting back from now.
+    /// `file` places it somewhere other than `<session>.jsonl` under the
+    /// project, which is where subagents' transcripts live.
     private func writeTranscript(
         project: String, session: String, cwd: String,
-        hoursAgo: [Int], outputPerResponse: Int = 1_000
+        hoursAgo: [Int], outputPerResponse: Int = 1_000, file: String? = nil
     ) throws {
-        let directory = sandbox
+        let target = sandbox
             .appendingPathComponent(".claude/projects")
             .appendingPathComponent(project)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            .appendingPathComponent(file ?? "\(session).jsonl")
+        try FileManager.default.createDirectory(
+            at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let messagePrefix = file ?? session
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -46,15 +51,13 @@ final class UsageLedgerTests: XCTestCase {
                 """)
             lines.append("""
                 {"type":"assistant","cwd":"\(cwd)","timestamp":"\(stamp)",\
-                "message":{"id":"\(session)-m\(index)","model":"claude-opus-5",\
+                "message":{"id":"\(messagePrefix)-m\(index)","model":"claude-opus-5",\
                 "content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":0,\
                 "output_tokens":\(outputPerResponse),"cache_creation_input_tokens":0,\
                 "cache_read_input_tokens":0}}}
                 """)
         }
-        try lines.joined(separator: "\n").write(
-            to: directory.appendingPathComponent("\(session).jsonl"),
-            atomically: true, encoding: .utf8)
+        try lines.joined(separator: "\n").write(to: target, atomically: true, encoding: .utf8)
     }
 
     func testIndexesEveryProjectDirectory() async throws {
@@ -69,6 +72,31 @@ final class UsageLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.sessions.count, 2)
         XCTAssertEqual(Set(ledger.projects().map(\.name)), ["alpha", "beta"])
         XCTAssertEqual(ledger.total(since: .distantPast).output, 3_000)
+    }
+
+    /// Subagents write their own transcripts under `<session>/subagents/`,
+    /// workflow agents a level further down, and on a heavy day that is most
+    /// of the spend. It has to be counted, and counted against the session
+    /// that spawned it rather than as a row per agent.
+    func testSubagentTranscriptsBillToTheSessionThatSpawnedThem() async throws {
+        try writeTranscript(
+            project: "-work-alpha", session: "s1", cwd: "/work/alpha", hoursAgo: [1])
+        try writeTranscript(
+            project: "-work-alpha", session: "s1", cwd: "/work/alpha", hoursAgo: [1, 2],
+            file: "s1/subagents/agent-a1.jsonl")
+        try writeTranscript(
+            project: "-work-alpha", session: "s1", cwd: "/work/alpha", hoursAgo: [1],
+            outputPerResponse: 4_000, file: "s1/subagents/workflows/wf_1/agent-b2.jsonl")
+
+        let ledger = UsageLedger()
+        await ledger.reindexNow()
+
+        XCTAssertEqual(ledger.sessions.count, 1)
+        let session = try XCTUnwrap(ledger.session(id: "s1"))
+        XCTAssertEqual(session.usage.output, 1_000 + 2_000 + 4_000)
+        XCTAssertEqual(ledger.total(since: .distantPast).output, 7_000)
+        // Only the parent's own prompt is a prompt; the subagents' briefs are not.
+        XCTAssertEqual(session.turns.map(\.prompt), ["prompt 0"])
     }
 
     /// The window views must count only what happened inside the window, not

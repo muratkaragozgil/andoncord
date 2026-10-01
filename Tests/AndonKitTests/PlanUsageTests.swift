@@ -99,6 +99,29 @@ final class PlanUsageFileTests: XCTestCase {
         XCTAssertLessThan(resetsAt.timeIntervalSince(now), week)
     }
 
+    /// A limit reset off-cycle — a plan change, a reset from Anthropic's
+    /// side — leaves a drop that is not the cadence, and often a tight one.
+    /// It must not drag the phase: the next reset still comes on schedule.
+    func testOffCycleResetDoesNotMoveTheWeeklyPhase() throws {
+        let base: Double = 1_800_000_000
+        let week: Double = 7 * 86_400
+        let offCycle = base + week + 1.2 * 86_400
+        let samples = try XCTUnwrap(PlanUsageFile.parse(document([
+            (base - 1_200, nil, 70), (base + 2_400, nil, 0),
+            (base + week - 600, nil, 60), (base + week + 1_200, nil, 0),
+            // The tightest bracket on record, and the wrong day.
+            (offCycle, nil, 100), (offCycle + 300, nil, 0),
+            (base + 2 * week - 3_000, nil, 50), (base + 2 * week + 2_400, nil, 1),
+        ])))
+
+        let now = Date(timeIntervalSince1970: base + 2 * week + 86_400)
+        let resetsAt = try XCTUnwrap(
+            PlanUsageFile.resetsAt(for: .sevenDay, samples: samples, now: now))
+        // The three on-cadence brackets intersect to [-600s, +1200s] around
+        // the true reset, so the estimate lands five minutes after it.
+        XCTAssertEqual(resetsAt.timeIntervalSince1970, base + 3 * week + 300, accuracy: 1)
+    }
+
     func testNoResetsMeansNoResetTime() throws {
         let base: Double = 1_800_000_000
         let samples = try XCTUnwrap(PlanUsageFile.parse(document([
