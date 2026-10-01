@@ -170,7 +170,15 @@ whose process disappears are reaped by a real pid liveness check, not a timer.
 
 ## Install
 
-**[⬇ Download AndonCord.dmg](https://github.com/MuratKaragozgil/andoncord/releases/latest/download/AndonCord.dmg)**,
+With [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask muratkaragozgil/tap/andoncord
+```
+
+`brew upgrade --cask andoncord` picks up new releases.
+
+Or **[⬇ download AndonCord.dmg](https://github.com/MuratKaragozgil/andoncord/releases/latest/download/AndonCord.dmg)**,
 open it, drag AndonCord into Applications, launch. Releases are Developer ID
 signed and notarised by Apple, so it opens with a plain double-click.
 

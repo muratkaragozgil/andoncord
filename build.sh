@@ -19,7 +19,7 @@ fi
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="AndonCord"
 BUNDLE_ID="app.andoncord.mac"
-VERSION="0.1.1"
+VERSION="0.2.0"
 
 cd "$ROOT"
 
