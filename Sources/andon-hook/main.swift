@@ -136,6 +136,11 @@ guard let raw = try? JSONDecoder().decode(JSONValue.self, from: stdinData) else 
 // the same treatment as a stale hook: it never reaches the board, and nothing
 // it runs ever waits on one.
 guard HookInvocation.isFromClaudeCode(raw) else { failOpen("Cursor payload on a Claude hook") }
+// The session AndonCord starts so Claude Code renews its sign-in. Its
+// statusline was worth caching above; its events are nobody's work.
+guard !HookInvocation.isRenewalSession(ProcessInfo.processInfo.environment) else {
+    failOpen("sign-in renewal session")
+}
 // A payload we cannot model is still worth forwarding — `raw` is intact and
 // the app can display it — so an empty decode is not fatal.
 let payload = (try? JSONDecoder().decode(HookPayload.self, from: stdinData)) ?? HookPayload()

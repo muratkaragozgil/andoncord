@@ -40,4 +40,15 @@ public struct HookInvocation: Equatable, Sendable {
     public static func isFromClaudeCode(_ payload: JSONValue) -> Bool {
         payload["cursor_version"] == nil
     }
+
+    /// Set on the session AndonCord starts so Claude Code renews its own
+    /// sign-in (`ClaudeCodeSignInRenewal`).
+    public static let renewalMarker = "ANDON_PROBE"
+
+    /// Whether a hook fired inside that session. Hooks inherit the session's
+    /// environment, and the session is AndonCord's own errand — a board that
+    /// showed it would be reporting on itself.
+    public static func isRenewalSession(_ environment: [String: String]) -> Bool {
+        environment[renewalMarker] == "1"
+    }
 }

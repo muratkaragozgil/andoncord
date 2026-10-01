@@ -433,7 +433,7 @@ public enum ClaudeCodeSignInRenewal {
 
         var environment = ProcessInfo.processInfo.environment
         environment["TERM"] = "xterm-256color"
-        environment["ANDON_PROBE"] = "1"
+        environment[HookInvocation.renewalMarker] = "1"
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["PATH"] = ([
             "\(Paths.home.path)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",

@@ -48,7 +48,9 @@ instead of just being announced.
 | 🔊 **Hear** | Synthesized 8-bit cues, one per event, distinct enough to learn by ear. Replace any of them by dropping a `.wav` into `~/.andoncord/sounds`. |
 | 📺 **Place** | The board lives on the display you choose — the notched built-in screen or any external monitor (Settings → Display). |
 
-Everything is local. No account, no server, no telemetry, no network calls.
+Everything is local. No account, no server, no telemetry, no network calls —
+unless you turn on **Exact usage from Anthropic** (below), which sends Claude
+Code's own sign-in token to Anthropic's usage endpoint and nothing else.
 
 ## Will it last?
 
@@ -67,18 +69,34 @@ terminal and it stops the moment you do.
 
 So AndonCord reads whichever source is actually alive, in this order:
 
-1. **`~/Library/Application Support/Claude/plan-usage-history.json`** — the
-   Claude desktop app's own record, written every five minutes with the same
-   two percentages its Usage panel shows, and carrying a month of history.
-   Read-only; nothing is written back.
-2. **Claude Code's statusline**, for machines without the desktop app.
-3. **The transcripts**, when both have gone quiet — one real reading fixes the
-   scale between measured spend and a percentage, and the ledger carries it
-   from there.
+1. **Anthropic itself**, when *Exact usage from Anthropic* is on in Settings.
+   Claude Code reads its quota from `api.anthropic.com/api/oauth/usage`,
+   signed in with the token it keeps in the login Keychain; AndonCord asks the
+   same question with the same token every five minutes. That is the figure
+   Claude's own usage panel shows, reset times included, plus model-scoped
+   weekly limits. Off by default, because it is the only thing AndonCord sends
+   off the Mac. The token is read through `/usr/bin/security`, which Claude
+   Code writes it with, so there is no Keychain prompt. AndonCord never
+   refreshes it itself — refresh tokens rotate, and a refresh Claude Code did
+   not perform would sign it out — so when it has lapsed, AndonCord starts
+   `claude` on a hidden terminal, asks for `/status`, and lets Claude Code
+   renew its own sign-in (at most every half hour).
+2. **`~/Library/Application Support/Claude/plan-usage-history.json`** — the
+   Claude desktop app's own record, sampled every fifteen minutes with the
+   same percentages its Usage panel shows, and carrying a month of history.
+   Recent versions only keep it current while the app's usage tray has been
+   opened in the last day. Read-only; nothing is written back.
+3. **Claude Code's statusline**, for machines without the desktop app.
+4. **The transcripts**, when the rest have gone quiet — one real reading fixes
+   the scale between measured spend and a percentage, and the ledger carries
+   it from there. Subagents and workflow agents write their own transcripts
+   under each session's `subagents/` folder, and those are counted too; on a
+   day of workflows they are most of the spend.
 
-Neither source records when a window *opened*, which is what the forecast
-needs. The history does, implicitly: a reset is the percentage falling, and
-consecutive samples bracket the moment it happened.
+Anthropic states each window's reset time outright. The desktop record does
+not, and that is what the forecast needs. Its history does, implicitly: a
+reset is the percentage falling, and consecutive samples bracket the moment it
+happened.
 
 ```
 13:29   5h  30%     ← still the old window
@@ -86,7 +104,9 @@ consecutive samples bracket the moment it happened.
 ```
 
 The weekly window resets on a fixed cadence, so every reset ever recorded
-constrains the same phase and the tightest bracket across a month pins it to
+constrains the same phase. Not every drop is the cadence — a limit can be
+reset off-cycle — so resets vote: the brackets that agree with each other
+modulo a week are intersected, and across a month that pins it to
 within a few minutes.
 
 And a figure is never presented as current when it isn't:
@@ -299,9 +319,10 @@ as text instead of guesswork.
   API, and the UI says "Click to raise" instead of pretending.
 - Sessions hosted by the **Claude desktop app** have no terminal at all; they
   are identified by the launching bundle and a click raises Claude.
-- **Quota needs an interactive session** — `claude -p` never renders a
-  statusline, so the usage strip stays empty until you run `claude` in a
-  terminal.
+- **Quota is exact only from Anthropic** — with *Exact usage from Anthropic*
+  off, the figure is as current as the desktop app's record (open its usage
+  tray once a day) or the last statusline, and between readings it is an
+  estimate, marked `~`. `claude -p` never renders a statusline at all.
 - First precise jump prompts for **Automation** permission (iTerm2 /
   Terminal.app only). Denying it degrades to app activation.
 - No SSH-remote sessions, no auto-update.

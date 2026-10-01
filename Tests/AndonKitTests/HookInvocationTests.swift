@@ -65,6 +65,14 @@ final class HookInvocationTests: XCTestCase {
         XCTAssertTrue(HookInvocation.isFromClaudeCode(claude))
     }
 
+    /// The session AndonCord starts to have Claude Code renew its sign-in
+    /// fires hooks like any other. They must not put it on the board.
+    func testTheRenewalSessionIsRecognised() {
+        XCTAssertTrue(HookInvocation.isRenewalSession([HookInvocation.renewalMarker: "1"]))
+        XCTAssertFalse(HookInvocation.isRenewalSession([:]))
+        XCTAssertFalse(HookInvocation.isRenewalSession([HookInvocation.renewalMarker: "0"]))
+    }
+
     /// The other direction of the same upgrade: a 0.1.x shim still tags every
     /// envelope with the agent it ran for.
     func testEnvelopeFromAnOlderShimStillDecodes() throws {
