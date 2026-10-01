@@ -113,7 +113,28 @@ final class AppState {
 
     private func computeQuotaReadout(_ kind: QuotaWindowKind, now: Date) -> QuotaReadout {
         let spent = ledger.total(since: windowStart(kind, now: now))
-        if let plan = planUsage.readout(kind, spent: spent, now: now) { return plan }
+        if let plan = planUsage.readout(kind, spent: spent, now: now) {
+            // The desktop app only polls while its usage tray has been opened
+            // in the last day, so its record can stop for hours with the app
+            // still running. A stale reading from it is carried forward by
+            // measured spend, exactly as a stale statusline one is, rather
+            // than drawn frozen at whatever it last saw.
+            guard case .reported(let at, stale: true) = plan.source,
+                  let used = plan.usedPercentage else { return plan }
+            let window = RateLimitWindow(usedPercentage: used, resetsAt: plan.resetsAt)
+            return QuotaReadout.compose(
+                kind: kind,
+                inputs: .init(
+                    limits: kind == .fiveHour
+                        ? RateLimits(fiveHour: window) : RateLimits(sevenDay: window),
+                    capturedAt: at,
+                    isStale: true,
+                    spentInWindow: spent,
+                    spentSinceReading: ledger.total(since: at),
+                    calibration: calibration,
+                    samples: quotaSamples(for: kind)),
+                now: now)
+        }
 
         let status = board.status
         return QuotaReadout.compose(

@@ -203,6 +203,26 @@ final class PlanUsageStoreTests: XCTestCase {
         XCTAssertFalse(weekly.isMeasured)
     }
 
+    /// The weekly reset is projected forward however old the samples are, so
+    /// a record that stopped before the last turnover would otherwise have
+    /// last week's figure drawn against this week's countdown.
+    func testRecordThatStoppedBeforeTheWeeklyResetSaysNothing() throws {
+        let now = Date()
+        let reset = now.addingTimeInterval(-10 * 86_400)
+        let last = now.addingTimeInterval(-4 * 86_400)   // the window turned over 3 days ago
+        try write("""
+            {"version":2,"samples":[
+              {"t":\(Int((reset.timeIntervalSince1970 - 450) * 1000)),"org":"o","u":{"fh":10,"sd":80}},
+              {"t":\(Int((reset.timeIntervalSince1970 + 450) * 1000)),"org":"o","u":{"fh":12,"sd":1}},
+              {"t":\(Int(last.timeIntervalSince1970 * 1000)),"org":"o","u":{"fh":30,"sd":64}}
+            ]}
+            """)
+
+        let store = PlanUsageStore()
+        store.reload()
+        XCTAssertNil(store.readout(.sevenDay, spent: TokenUsage(), now: now))
+    }
+
     func testMissingFileYieldsNothingRatherThanZeroes() {
         let store = PlanUsageStore()
         store.reload()

@@ -95,6 +95,11 @@ public final class PlanUsageStore {
         // lapsed. (A record that is still being written is current by
         // definition, so a missing bracket there just costs the countdown.)
         if kind == .fiveHour, resetsAt == nil, used == 0 || !isFresh { return nil }
+        // A record that went quiet before the window last turned over is
+        // describing the previous one. The weekly reset is projected forward
+        // regardless of how old the samples are, so without this a figure from
+        // last week would be drawn against this week's countdown.
+        if let resetsAt, latest.at < resetsAt.addingTimeInterval(-kind.length) { return nil }
 
         let forecast = resetsAt.map {
             QuotaForecast.project(
