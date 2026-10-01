@@ -62,31 +62,6 @@ public struct ToolPresentation: Sendable, Equatable {
         func string(_ key: String) -> String? { object[key]?.stringValue }
 
         switch toolName {
-        // Gemini names the same operations differently; map them onto the
-        // same presentations so a Gemini row reads like any other.
-        case "run_shell_command":
-            let command = string("command") ?? ""
-            return ToolPresentation(
-                title: "Shell", subtitle: firstLine(command),
-                kind: .shell(command: command, description: string("description")))
-        case "read_file":
-            let path = string("absolute_path") ?? string("file_path") ?? ""
-            return ToolPresentation(title: "Read", subtitle: shortPath(path), kind: .read(path: path))
-        case "write_file":
-            let path = string("file_path") ?? ""
-            let content = string("content") ?? ""
-            let lines = content.isEmpty ? 0 : content.components(separatedBy: "\n").count
-            return ToolPresentation(title: "Write", subtitle: shortPath(path),
-                                    kind: .write(path: path, lineCount: lines))
-        case "replace":
-            let detail = EditDetail(
-                path: string("file_path") ?? "",
-                oldString: string("old_string") ?? "",
-                newString: string("new_string") ?? "",
-                replaceAll: false)
-            return ToolPresentation(title: "Edit", subtitle: shortPath(detail.path),
-                                    kind: .edit(detail))
-
         case "Edit":
             let detail = EditDetail(
                 path: string("file_path") ?? "",

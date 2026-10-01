@@ -184,7 +184,6 @@ struct CollapsedPillView: View {
         if let focus {
             HStack(spacing: 7) {
                 AndonLamp(state: focus.state)
-                AgentBadge(agent: focus.agent)
                 Text(focus.title)
                     .font(AndonTheme.body(11, weight: .medium))
                     .foregroundStyle(AndonTheme.textPrimary)

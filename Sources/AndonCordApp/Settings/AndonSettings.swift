@@ -12,7 +12,6 @@ final class AndonSettings {
         static let autoExpand = "autoExpandOnCord"
         static let showUsage = "showUsage"
         static let preferredDisplay = "preferredDisplayName"
-        static let cursorGate = "cursorGateEnabled"
         static let hideWhenIdle = "hideWhenIdle"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let quietWhileFocused = "quietWhileFocused"
@@ -29,7 +28,6 @@ final class AndonSettings {
             Key.volume: 0.5,
             Key.autoExpand: true,
             Key.showUsage: true,
-            Key.cursorGate: false,
             // Off by default: a pill that vanishes when the board empties made
             // "is it broken or just idle?" unanswerable. The idle pill now
             // shows a red stopped lamp instead — visible proof of both states.
@@ -96,17 +94,6 @@ final class AndonSettings {
             if let newValue { defaults.set(newValue, forKey: Key.preferredDisplay) }
             else { defaults.removeObject(forKey: Key.preferredDisplay) }
         }
-    }
-
-    /// Whether Cursor's shell commands are gated through the notch.
-    ///
-    /// Off by default and deliberately so: Cursor fires the gate hook for
-    /// every shell command — allowlisted ones included — and a hook decision
-    /// bypasses Cursor's own approval UI. That is a workflow change to opt
-    /// into, not a default.
-    var cursorGateEnabled: Bool {
-        get { defaults.bool(forKey: Key.cursorGate) }
-        set { defaults.set(newValue, forKey: Key.cursorGate) }
     }
 
     /// Hide the pill entirely when nothing is running, so the notch looks

@@ -268,6 +268,19 @@ final class BoardStoreTests: XCTestCase {
         send(payload(.notification) { $0.notificationType = "permission_prompt" })
         XCTAssertEqual(store.session(id: "s1")?.state, .cordPulled(.attention))
     }
+
+    func testAttentionClearsOnceTheTerminalAnswers() {
+        // Nothing is parked, so there is no card to answer: the human answers
+        // in the terminal, and the board learns it from work resuming.
+        send(payload(.notification) { $0.notificationType = "permission_prompt" })
+        send(payload(.preToolUse, tool: "Bash"))
+        XCTAssertEqual(store.session(id: "s1")?.state, .working(tool: "Bash"))
+
+        send(payload(.notification) { $0.notificationType = "permission_prompt" })
+        send(payload(.stop) { $0.message = "Done." })
+        XCTAssertEqual(store.session(id: "s1")?.state, .done)
+        XCTAssertEqual(store.session(id: "s1")?.lastAssistantMessage, "Done.")
+    }
 }
 
 /// Reaping sessions whose process is gone.

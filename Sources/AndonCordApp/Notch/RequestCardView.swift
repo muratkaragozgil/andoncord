@@ -29,8 +29,7 @@ struct RequestCardView: View {
                          onApprove: { app.board.approvePlan(request) },
                          onReject: { app.board.rejectPlan(request, feedback: $0) })
             default:
-                PermissionBody(tool: tool, request: request, app: app,
-                               agent: session.agent)
+                PermissionBody(tool: tool, request: request, app: app)
             }
         }
         .padding(.horizontal, AndonTheme.Metrics.horizontalPadding)
@@ -57,7 +56,6 @@ struct RequestCardView: View {
 
             Spacer(minLength: 4)
 
-            AgentBadge(agent: session.agent)
             Text(session.title)
                 .font(AndonTheme.body(10))
                 .foregroundStyle(AndonTheme.textTertiary)
@@ -68,7 +66,7 @@ struct RequestCardView: View {
     private var headline: String {
         switch request.kind {
         case .permission: return "CORD PULLED · PERMISSION"
-        case .question: return "\(session.agent.displayName.uppercased()) ASKS"
+        case .question: return "CLAUDE ASKS"
         case .plan: return "PLAN REVIEW"
         }
     }
@@ -80,7 +78,6 @@ private struct PermissionBody: View {
     let tool: ToolPresentation
     let request: PendingRequest
     let app: AppState
-    let agent: AgentSource
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -112,16 +109,6 @@ private struct PermissionBody: View {
                 .buttonStyle(AndonButtonStyle(tint: AndonTheme.green, prominent: true))
                 .keyboardShortcut("y", modifiers: .command)
 
-                // Cursor's gate intercepts before its own approval UI ever
-                // shows; "Ask in Cursor" hands the decision back to it for
-                // the times you want the command in its full context.
-                if agent == .cursor {
-                    Button("Ask in Cursor") {
-                        app.board.deferToAgent(request)
-                    }
-                    .buttonStyle(AndonButtonStyle(tint: AndonTheme.agentTint(.cursor)))
-                }
-
                 // Persists an allow rule so this shape of call stops asking.
                 if let rule = alwaysAllowRule {
                     Button("Always allow") {
@@ -142,10 +129,7 @@ private struct PermissionBody: View {
 
     /// A permission rule matching the whole tool, which is the only
     /// generalisation safe to offer without guessing at argument shapes.
-    /// Claude-only: no other agent has a persistent rule concept in its
-    /// decision contract.
     private var alwaysAllowRule: String? {
-        guard agent == .claude else { return nil }
         switch tool.kind {
         case .shell:
             // Bash rules are argument-sensitive; blanket-allowing every shell

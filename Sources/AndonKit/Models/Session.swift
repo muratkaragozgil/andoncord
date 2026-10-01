@@ -114,7 +114,6 @@ public struct PendingRequest: Identifiable, Sendable, Equatable {
 /// One tracked Claude Code session.
 public struct Session: Identifiable, Sendable {
     public let id: String
-    public var agent: AgentSource
     public var title: String
     public var cwd: String?
     public var transcriptPath: String?
@@ -161,7 +160,6 @@ public struct Session: Identifiable, Sendable {
 
     public init(
         id: String,
-        agent: AgentSource = .claude,
         title: String = "Session",
         cwd: String? = nil,
         transcriptPath: String? = nil,
@@ -179,7 +177,6 @@ public struct Session: Identifiable, Sendable {
         activeSubagents: Set<String> = []
     ) {
         self.id = id
-        self.agent = agent
         self.title = title
         self.cwd = cwd
         self.transcriptPath = transcriptPath

@@ -49,28 +49,23 @@ func currentTTYPath() -> String? {
 
 // MARK: - Argument parsing
 
-let arguments = Array(CommandLine.arguments.dropFirst())
-let isStatusline = arguments.contains("--statusline")
-/// Set by the installer only on the hooks where a human decision is expected,
-/// so the common path never waits on a reply.
-let isBlocking = arguments.contains("--blocking")
-
-/// `--source claude|codex`, written into each hook command by the installer.
-/// Absent → `.claude`, since that is the only agent an un-tagged hook could be.
-let agentSource: AgentSource = {
-    guard let index = arguments.firstIndex(of: "--source"),
-          index + 1 < arguments.count else { return .claude }
-    return AgentSource(argument: arguments[index + 1])
-}()
+let invocation = HookInvocation(arguments: Array(CommandLine.arguments.dropFirst()))
 
 // MARK: - Read stdin
 
 let stdinData = FileHandle.standardInput.readDataToEndOfFile()
+
+// A hook 0.1.x installed into another agent: do nothing, successfully, and
+// never reach the app. Checked only once stdin is drained. Exiting first would
+// leave a writer whose payload outgrows the pipe buffer to meet a closed pipe,
+// and how another tool handles that is not ours to find out on its users'
+// critical path.
+guard invocation.isClaudeCode else { failOpen("not a Claude Code hook") }
 guard !stdinData.isEmpty else { failOpen("empty stdin") }
 
 // MARK: - Statusline mode
 
-if isStatusline {
+if invocation.isStatusline {
     // Claude Code exposes `rate_limits` on the statusline payload and nowhere
     // else, which is the entire reason AndonCord installs a statusline at
     // all. Cache it, then hand control to whatever statusline the user had
@@ -137,6 +132,10 @@ if isStatusline {
 guard let raw = try? JSONDecoder().decode(JSONValue.self, from: stdinData) else {
     failOpen("stdin was not JSON")
 }
+// Cursor running the hooks we wrote for Claude. Not a Claude Code session, so
+// the same treatment as a stale hook: it never reaches the board, and nothing
+// it runs ever waits on one.
+guard HookInvocation.isFromClaudeCode(raw) else { failOpen("Cursor payload on a Claude hook") }
 // A payload we cannot model is still worth forwarding — `raw` is intact and
 // the app can display it — so an empty decode is not fatal.
 let payload = (try? JSONDecoder().decode(HookPayload.self, from: stdinData)) ?? HookPayload()
@@ -148,8 +147,7 @@ let terminal = TerminalContext.capture(
 )
 
 let envelope = HookEnvelope(
-    blocking: isBlocking,
-    agentSource: agentSource,
+    blocking: invocation.isBlocking,
     payload: payload,
     raw: raw,
     terminal: terminal,
@@ -166,7 +164,7 @@ guard let fd = try? SocketTransport.connect(
     // Blocking hooks are configured with a 24h timeout in settings.json so a
     // permission prompt can sit on the board as long as a terminal prompt
     // would. Non-blocking hooks must never delay a tool call.
-    timeout: isBlocking ? 86_400 : 2
+    timeout: invocation.isBlocking ? 86_400 : 2
 ) else {
     failOpen("no listener at \(socketPath)")
 }
@@ -176,7 +174,7 @@ guard (try? SocketTransport.writeLine(encoded, to: fd)) != nil else {
     failOpen("write failed")
 }
 
-guard isBlocking else {
+guard invocation.isBlocking else {
     // Fire and forget. close() flushes the stream socket.
     exit(0)
 }

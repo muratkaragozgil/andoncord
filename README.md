@@ -4,7 +4,7 @@
 
 # AndonCord
 
-**Claude Code, Codex, Gemini CLI & Cursor sessions on your Mac's notch.**
+**Claude Code sessions on your Mac's notch.**
 Approve tool calls, answer questions, and review plans — without leaving your editor.
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-black)
@@ -17,9 +17,9 @@ Approve tool calls, answer questions, and review plans — without leaving your 
 
 <br>
 
-<img src="docs/demo.gif" width="640" alt="AndonCord: four agents on one board with live quota, then Cursor's shell gate asks for a decision">
+<img src="docs/demo.gif" width="640" alt="AndonCord: four Claude Code sessions on one board with live quota, then one pulls the cord on a shell command">
 
-<sub>Four agents on one board with live quota — then Cursor's shell gate pulls the cord: Deny, Allow, or hand it back with "Ask in Cursor".</sub>
+<sub>Four sessions on one board with live quota — then one pulls the cord, and the command it wants to run waits in the notch for Deny or Allow.</sub>
 
 </div>
 
@@ -31,25 +31,10 @@ status at a glance. That is exactly what this app is: Claude Code pulls the
 cord when it needs you, the board in your notch lights up, you answer, the
 line resumes.
 
-Integrated deeply rather than broadly — each agent added only as far as its
-hook contract honestly allows, and the UI never pretends otherwise:
-
-| | Agent | Watch | Answer from the notch | Hooks live in |
-|---|---|---|---|---|
-| <img src="docs/icons/claude.svg" width="16" alt=""> | **Claude Code** | ✓ | ✓ permissions · questions · plan review | `~/.claude/settings.json` |
-| <img src="docs/icons/codex.svg" width="16" alt=""> | **Codex** | ✓ | ✓ permissions | `~/.codex/hooks.json` |
-| <img src="docs/icons/gemini.svg" width="16" alt=""> | **Gemini CLI** | ✓ | alert + jump — Gemini hooks can announce an approval but not answer it | `~/.gemini/settings.json` |
-| <img src="docs/icons/cursor.svg" width="16" alt=""> | **Cursor** | ✓ | opt-in shell gate: Allow · Deny · Ask in Cursor | `~/.cursor/hooks.json` |
-
-One shim, one socket, one board; a `--source` tag per hook command is all that
-tells the agents apart. Claude Code and Codex share the decision format, so
-approvals round-trip from the notch. Gemini's `Notification` hook fires when a
-dialog appears but is fire-and-forget by design, so there the board alerts you
-and precise jump takes you to the terminal to decide. Cursor has no "approval
-needed" event at all — instead its `beforeShellExecution` hook *is* the
-approval — so AndonCord watches by default and offers an opt-in gate that
-parks every shell command in the notch, with **Ask in Cursor** as the
-hand-back-to-native escape hatch.
+Claude-Code-only, on purpose. One agent supported deeply beats twenty supported
+shallowly — it is what lets the permission card show a real diff, the plan
+reviewer render real Markdown, and questions get answered from the notch
+instead of just being announced.
 
 ## What it does
 
@@ -155,13 +140,9 @@ The board reads like an andon board — colour and motion first, text second:
 
 | Lamp | Meaning |
 |---|---|
-| 🟢 bouncing equalizer + ticking timer | the line is moving — the agent is working |
+| 🟢 bouncing equalizer + ticking timer | the line is moving — Claude is working |
 | 🟠 hard blink + `CORD` badge | cord pulled — a decision is waiting on you |
 | 🔴 steady dot | stopped — idle, finished, or failed |
-
-Each session also wears its agent's mark — Claude's starburst, the OpenAI
-knot, Gemini's spark, Cursor's cube — tinted per agent, so a mixed board never
-leaves you guessing who just pulled the cord.
 
 If it's green and moving, it's working. If it's red and still, it isn't.
 There is no state where a dead session can impersonate a live one: sessions
@@ -183,48 +164,35 @@ cp -R "build/AndonCord.app" /Applications/
 open /Applications/AndonCord.app
 ```
 
-First launch walks you through Claude Code setup; **Settings** has separate
-rows for Codex and Gemini CLI. With your consent AndonCord will:
+First launch walks you through setup. With your consent AndonCord will:
 
-- **Claude Code** — add hook entries to `~/.claude/settings.json`, **alongside**
-  anything already there, and point `statusLine` at a wrapper that **chains to
-  your existing statusline** so its output keeps rendering
-- **Codex** — add hooks to `~/.codex/hooks.json`, a file that is separate from
-  `config.toml` and additive by design, so your existing Codex config and
-  `notify` command are left untouched
-- **Gemini CLI** — add named hooks to `~/.gemini/settings.json` using Gemini's
-  own event vocabulary (`BeforeTool`, `AfterAgent`, …); event arrays merge
-  additively across scopes, and the entries show up by name in `/hooks`
-- **Cursor** — add entries to `~/.cursor/hooks.json` (flat schema, hot-reloaded
-  by Cursor); the shell gate is a separate toggle that rewrites the file live
+- add hook entries to `~/.claude/settings.json` — **alongside** anything already
+  there; other tools' hooks keep running
+- point `statusLine` at a wrapper that **chains to your existing statusline**,
+  so its output keeps rendering
 - create `~/.andoncord/` for the local socket, the hook launcher, and a
-  timestamped backup taken before every change
+  timestamped backup of `settings.json` taken before every change
 
-Each integration is independent — enable any combination. **Settings →
-Remove** puts each file back exactly as it was; only entries carrying our marker
-are touched. Already-running sessions need a restart before hooks apply.
+**Settings → Remove** puts everything back exactly as it was; only entries
+carrying our marker are touched. Already-running Claude Code sessions need a
+restart before hooks apply.
 
-> **Codex note:** hooks are a recent, sometimes-gated Codex feature. If Codex
-> sessions don't appear, enable it with `[features] hooks = true` in
-> `~/.codex/config.toml` — the Settings row detects this and tells you.
+> **Upgrading from 0.1.x:** earlier releases could also add hooks to Codex,
+> Gemini CLI, and Cursor. Those hooks are now inert — the shim sees they are
+> not Claude Code's and exits without a word, so the other tool carries on as
+> if they were not there — but each still costs a process spawn per event.
+> To remove them, delete the entries that reference
+> `~/.andoncord/bin/andon-hook` from `~/.codex/hooks.json`,
+> `~/.gemini/settings.json`, and `~/.cursor/hooks.json`.
 
 ## How it works
 
 ```
-Claude Code ┐
-Codex       ├─spawns─▶ andon-hook ──unix socket──▶ AndonCord.app
-Gemini CLI  ┘        (--source tags     one socket,  (the board)
-   (hooks)            the agent)        every agent
+Claude Code ──spawns──▶ andon-hook ──unix socket──▶ AndonCord.app
+   (hooks)              (the shim)                   (the board)
       ▲                                                   │
       └──────────── decision JSON on stdout ◀─────────────┘
 ```
-
-Every agent runs the **same shim** over the **same socket**; a `--source`
-argument written into each hook command is all that distinguishes them. Gemini
-renamed the events (`BeforeTool`, `AfterAgent`, …) but kept Claude's structure,
-so a small normalisation table in `HookEventName` is the entire cost of
-understanding its dialect — the board, cards, and approval round trip stay
-agent-agnostic.
 
 **The shim is a real process, not an HTTP callback — deliberately.** Claude
 Code spawns it as a child of your shell, so it inherits the controlling TTY and
@@ -258,6 +226,9 @@ output — which Claude Code reads as "the hook had no opinion":
 - app not running → exit 0, Claude Code carries on
 - app dies mid-decision → hook released, Claude Code falls back to its own prompt
 - session closed while a request is parked → hook released immediately
+- run by anything other than Claude Code — a hook 0.1.x left in another
+  agent's config, or Cursor running the ones in `~/.claude/settings.json` →
+  exit 0 before the socket is ever touched
 
 The worst case is that AndonCord becomes invisible. It never breaks Claude Code.
 
@@ -276,7 +247,7 @@ feedback loop is structurally impossible.
 Sources/
   AndonKit/            # models, socket, installer, store — no AppKit
     Server/            # HookServer, SocketTransport, PendingDecision
-    Integration/       # Claude/Codex/Gemini installers, LauncherWriter, JSONC
+    Integration/       # ClaudeSettingsInstaller, LauncherWriter, JSONC
     Store/             # BoardStore — the state machine + session reaper
     Audio/             # ChiptuneEngine — synthesized 8-bit cues
   andon-hook/          # the shim: tiny, fail-open, terminal-aware
@@ -284,12 +255,12 @@ Sources/
     Notch/             # fixed-size panel, pill, board, request cards
     Terminal/          # precise jump (AppleScript / CLI / tmux)
 Tools/make-icon.swift      # the app icon, generated from the theme palette
-Tools/make-demo-gif.sh     # the README demo, rendered from the same palette + geometry
+Tools/make-demo-gif.swift  # the README demo, rendered from the same palette + geometry
 ```
 
 > The demo above is rendered offscreen from the app's own palette, geometry, and
 > equalizer math — not a live screen capture — so it shows exactly what the app
-> draws. Regenerate it with `Tools/make-demo-gif.sh docs/demo.gif`.
+> draws. Regenerate it with `swift Tools/make-demo-gif.swift docs/demo.gif`.
 
 `AndonKit` deliberately avoids AppKit so the shim stays light — it is spawned
 on every tool call (~10 ms). The icon is code, not an asset, so it can never
@@ -308,12 +279,10 @@ The tests that matter most:
 - **RoundTripTests** — run the actual `andon-hook` binary as a subprocess over
   a real Unix socket and assert on what it prints to stdout, which is the only
   thing Claude Code ever reads. Covers the approval round trip,
-  release-on-session-end, fail-open, and hot-path latency.
-- **InstallerTests / CodexInstallerTests** — coexistence with other tools'
-  hooks in both `settings.json` and `hooks.json`, byte-exact statusline
-  restoration, idempotent reinstall, drift detection, and Codex feature-flag
-  detection. A round-trip test confirms a `--source codex` hook tags its
-  session as Codex while a Claude hook on the same socket stays Claude.
+  release-on-session-end, fail-open, hot-path latency, and hooks 0.1.x left
+  in other agents never reaching the app at all.
+- **InstallerTests** — coexistence with other tools' hooks, byte-exact
+  statusline restoration, idempotent reinstall, drift detection, JSONC comments.
 - **BoardStoreTests / ReapingTests** — every code path releases its parked
   hook (a leak here is someone's hung session), and dead sessions are reaped
   by pid liveness while parked requests are never swept.
@@ -332,20 +301,7 @@ as text instead of guesswork.
   are identified by the launching bundle and a click raises Claude.
 - **Quota needs an interactive session** — `claude -p` never renders a
   statusline, so the usage strip stays empty until you run `claude` in a
-  terminal. (Codex quota is not surfaced; there is no equivalent statusline.)
-- **Codex hooks are version-gated** — the feature is recent and, on some
-  builds, off by default. AndonCord installs the hooks and detects the flag,
-  but cannot flip it for you.
-- **Gemini is watch-only** — its hooks cannot answer approvals (`Notification`
-  is fire-and-forget and `BeforeTool` runs post-approval), so the board
-  alerts and jumps instead of showing Allow/Deny. Requires Gemini CLI ≥ 0.26.
-- **Cursor's gate gates everything** — `beforeShellExecution` fires for every
-  shell command, allowlisted ones included, and a hook decision bypasses
-  Cursor's own approval UI. That is why the gate is opt-in. Requires a 2026
-  `cursor-agent` (older CLIs never fire hooks — run `cursor-agent update`).
-  Cursor's CLI also runs Claude-format hooks from `settings.json`; AndonCord
-  detects `cursor_version` in those payloads and folds the double-fire into
-  one correctly-badged session.
+  terminal.
 - First precise jump prompts for **Automation** permission (iTerm2 /
   Terminal.app only). Denying it degrades to app activation.
 - No SSH-remote sessions, no auto-update.
@@ -353,9 +309,6 @@ as text instead of guesswork.
 ## Credits
 
 Inspired by [Vibe Island](https://vibeisland.app), which supports 26 agents.
-Agent marks are drawn from [Simple Icons](https://simpleicons.org) path data
-(CC0); the logos remain trademarks of their respective owners.
-AndonCord is the opposite bet: a small, deliberately chosen set of agents —
-Claude Code, Codex, Gemini CLI, and Cursor — each integrated exactly as deeply
-as its hooks allow, rather than many wired up shallowly. Built with
-[Claude Code](https://claude.com/claude-code) — one of the tools it watches.
+AndonCord is the opposite bet: one agent, integrated as deeply as the hooks
+allow. Built with [Claude Code](https://claude.com/claude-code) — the tool it
+watches.

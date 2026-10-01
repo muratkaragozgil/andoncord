@@ -7,13 +7,11 @@ import UniformTypeIdentifiers
 // Renders a faithful demo of the AndonCord notch panel, frame by frame, into an
 // animated GIF. Not a screen capture (the build environment has no
 // screen-recording permission) — every pixel is drawn from the same palette,
-// geometry, equalizer math, agent tints, and glyphs the real app uses, so it
-// mirrors what the app renders. The story: four agents (Claude Code, Codex,
-// Gemini, Cursor) running at once under the live quota strip, then Cursor's
-// shell gate pulls the cord — Deny / Allow / Ask in Cursor.
+// geometry, and equalizer math the real app uses, so it mirrors what the app
+// renders. The story: four Claude Code sessions running at once under the live
+// quota strip, then one of them pulls the cord on a shell command.
 //
-// Built by Tools/make-demo-gif.sh, which compiles this file together with
-// Sources/AndonKit/Models/AgentGlyph.swift (the shared agent marks).
+// Run with `swift Tools/make-demo-gif.swift docs/demo.gif`.
 
 // MARK: - Palette (mirrors AndonTheme)
 
@@ -30,10 +28,6 @@ let textTertiary = C(0.431, 0.404, 0.353)
 let amber = C(0.910, 0.639, 0.239)
 let green = C(0.341, 0.780, 0.498)
 let red = C(0.898, 0.329, 0.294)
-let claudeTint = C(0.827, 0.510, 0.361)  // AgentSource.claude
-let codexTint = C(0.478, 0.686, 0.937)   // AgentSource.codex
-let geminiTint = C(0.557, 0.749, 0.518)  // AgentSource.gemini
-let cursorTint = C(0.678, 0.580, 0.937)  // AgentSource.cursor
 let inactive = C(0.290, 0.267, 0.227)
 
 func nscolor(_ c: CGColor) -> NSColor { NSColor(cgColor: c) ?? .white }
@@ -100,22 +94,6 @@ func dot(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, size: CGFloat, color: CGCol
                        cornerWidth: size * 0.3, cornerHeight: size * 0.3, transform: nil))
     ctx.fillPath(); ctx.restoreGState()
 }
-/// Agent glyph chip, matching AgentBadge. `cy` is in CG (y-up) space.
-func badge(_ ctx: CGContext, _ glyph: CGPath, x: CGFloat, cy: CGFloat, tint: CGColor) -> CGFloat {
-    let side: CGFloat = 16, glyphSide: CGFloat = 10
-    let chip = CGRect(x: x, y: cy - side / 2, width: side, height: side)
-    ctx.setFillColor(tint.copy(alpha: 0.16)!)
-    ctx.addPath(roundedPath(chip, 3.5)); ctx.fillPath()
-    ctx.saveGState()
-    // SVG glyphs are y-down; this context is y-up — flip while placing.
-    ctx.translateBy(x: x + (side - glyphSide) / 2, y: cy + glyphSide / 2)
-    ctx.scaleBy(x: glyphSide / AgentGlyph.viewBox, y: -glyphSide / AgentGlyph.viewBox)
-    ctx.addPath(glyph)
-    ctx.setFillColor(tint)
-    ctx.fillPath()
-    ctx.restoreGState()
-    return side
-}
 func pillButton(_ ctx: CGContext, _ label: String, x: CGFloat, top: CGFloat,
                 tint: CGColor, prominent: Bool, highlight: Bool = false) -> CGFloat {
     let padH: CGFloat = 12, fs: CGFloat = 12
@@ -134,8 +112,7 @@ func pillButton(_ ctx: CGContext, _ label: String, x: CGFloat, top: CGFloat,
 
 /// One session row on the board.
 func sessionRow(_ ctx: CGContext, x: CGFloat, top: CGFloat, width: CGFloat, t: Double,
-                glyph: CGPath, agentTint: CGColor, title: String, terminal: String,
-                seconds: Int, cord: Bool, status: String) {
+                title: String, terminal: String, seconds: Int, cord: Bool, status: String) {
     let cy = CGFloat(H) - top - 23
     if cord {
         let blink = sin(t * 7) > 0 ? 1.0 : 0.55
@@ -143,15 +120,14 @@ func sessionRow(_ ctx: CGContext, x: CGFloat, top: CGFloat, width: CGFloat, t: D
     } else {
         equalizer(ctx, cx: x + 16, cy: cy, size: 12, t: t, color: green)
     }
-    let bw = badge(ctx, glyph, x: x + 30, cy: cy, tint: agentTint)
-    text(ctx, title, x + 30 + bw + 8, top + 9, size: 12, color: textPrimary, weight: .medium)
+    text(ctx, title, x + 30, top + 9, size: 12, color: textPrimary, weight: .medium)
     let timeLabel = "\(seconds)s"
     let timeW = tw(timeLabel, size: 10, mono: true)
     text(ctx, timeLabel, x + width - 14 - timeW, top + 10, size: 10,
          color: cord ? amber : green, weight: .medium, mono: true)
     let termW = tw(terminal, size: 9)
     text(ctx, terminal, x + width - 14 - timeW - 10 - termW, top + 11, size: 9, color: textTertiary)
-    text(ctx, status, x + 30 + bw + 8, top + 25, size: 10.5, color: cord ? amber : textSecondary)
+    text(ctx, status, x + 30, top + 25, size: 10.5, color: cord ? amber : textSecondary)
 }
 
 /// The quota strip under the header — 5-hour and weekly windows, real feature.
@@ -249,8 +225,8 @@ func ramp(_ t: Double, _ a: Double, _ b: Double) -> Double {
 func drawFrame(_ ctx: CGContext, t: Double) {
     drawWallpaper(ctx)
 
-    // Timeline (s): 0-1 idle | 1-1.4 expand | 1.4-4.6 two agents working
-    //   | 4.6 Codex pulls cord | 5-7.4 permission card | 7.4-7.8 collapse
+    // Timeline (s): 0-1 idle | 1-1.4 expand | 1.4-4.6 four sessions working
+    //   | 4.6 one pulls the cord | 5-7.4 permission card | 7.4-7.8 collapse
     let boardExpand = ramp(t, 1.0, 1.4) - ramp(t, 7.4, 7.7)
     let cordPulled = t >= 4.6 && t < 7.5
     let showCard = t >= 5.0 && t < 7.5
@@ -294,31 +270,32 @@ func drawFrame(_ ctx: CGContext, t: Double) {
 
     var y = pillH + 27 + 8
     sessionRow(ctx, x: x, top: y, width: w, t: t,
-               glyph: AgentGlyph.claude, agentTint: claudeTint, title: "fix auth in middleware.ts",
+               title: "fix auth in middleware.ts",
                terminal: "iTerm2", seconds: 12 + Int(t), cord: false,
-               status: Int(t) % 2 == 0 ? "Edit(middleware.ts)" : "Running…")
+               status: Int(t) % 2 == 0 ? "Edit(middleware.ts)" : "Thinking…")
     y += 46
     ctx.setFillColor(hairline.copy(alpha: 0.5)!); ctx.fill(rTL(x + 30, y - 2, w - 44, 1))
     sessionRow(ctx, x: x, top: y, width: w, t: t + 0.7,
-               glyph: AgentGlyph.openai, agentTint: codexTint, title: "add unit tests for parser",
+               title: "add unit tests for parser",
                terminal: "Ghostty", seconds: 8 + Int(t), cord: false,
-               status: Int(t) % 2 == 0 ? "apply_patch" : "Running…")
+               status: Int(t) % 2 == 0 ? "Bash(npm test)" : "Thinking…")
     y += 46
     ctx.setFillColor(hairline.copy(alpha: 0.5)!); ctx.fill(rTL(x + 30, y - 2, w - 44, 1))
     sessionRow(ctx, x: x, top: y, width: w, t: t + 1.4,
-               glyph: AgentGlyph.gemini, agentTint: geminiTint, title: "migrate configs to v2",
+               title: "migrate configs to v2",
                terminal: "Terminal", seconds: 21 + Int(t), cord: false,
-               status: Int(t) % 2 == 0 ? "run_shell_command" : "Running…")
+               status: Int(t) % 2 == 0 ? "Read(config/v2.ts)" : "Thinking…")
     y += 46
     ctx.setFillColor(hairline.copy(alpha: 0.5)!); ctx.fill(rTL(x + 30, y - 2, w - 44, 1))
     sessionRow(ctx, x: x, top: y, width: w, t: t + 2.1,
-               glyph: AgentGlyph.cursor, agentTint: cursorTint, title: "refactor api client",
-               terminal: "Cursor", seconds: 33 + Int(t), cord: cordPulled,
-               status: cordPulled ? "Waiting on you — Shell" : (Int(t) % 2 == 0 ? "Edit(client.ts)" : "Running…"))
+               title: "ship the staging build",
+               terminal: "WezTerm", seconds: 33 + Int(t), cord: cordPulled,
+               status: cordPulled ? "Waiting on you — Bash(npm run deploy)"
+                   : (Int(t) % 2 == 0 ? "Bash(npm run build)" : "Thinking…"))
     y += 48
     ctx.restoreGState()
 
-    // ── Codex permission card ──
+    // ── Permission card ──
     if showCard {
         let ca = ramp(t, 5.2, 5.6) * (1 - ramp(t, 7.3, 7.55))
         ctx.saveGState(); ctx.setAlpha(ca)
@@ -330,11 +307,11 @@ func drawFrame(_ ctx: CGContext, t: Double) {
         var cy = cardTop + 11
         dot(ctx, cx: x + 20, cy: CGFloat(H) - cy - 8, size: 7, color: amber, glow: 0.9)
         text(ctx, "CORD PULLED · PERMISSION", x + 30, cy + 3, size: 10, color: amber, weight: .semibold, tracking: 0.8)
-        let bw = badge(ctx, AgentGlyph.cursor, x: x + w - 16 - 108, cy: CGFloat(H) - cy - 8, tint: cursorTint)
-        text(ctx, "refactor api client", x + w - 16 - 108 + bw + 6, cy + 3, size: 10, color: textTertiary)
+        let cardTitle = "ship the staging build"
+        text(ctx, cardTitle, x + w - 16 - tw(cardTitle, size: 10), cy + 3, size: 10, color: textTertiary)
         cy += 25
-        text(ctx, "Shell", x + 16, cy, size: 13, color: textPrimary, weight: .semibold)
-        text(ctx, "npm run deploy", x + 16 + tw("Shell ", size: 13, weight: .semibold), cy + 1,
+        text(ctx, "Bash", x + 16, cy, size: 13, color: textPrimary, weight: .semibold)
+        text(ctx, "npm run deploy", x + 16 + tw("Bash ", size: 13, weight: .semibold), cy + 1,
              size: 11, color: textSecondary, mono: true)
         cy += 23
         let box = rTL(x + 16, cy, w - 32, 30)
@@ -342,10 +319,8 @@ func drawFrame(_ ctx: CGContext, t: Double) {
         text(ctx, "npm run deploy", x + 24, cy + 8, size: 11, color: textPrimary, mono: true)
         cy += 44
         let dw = pillButton(ctx, "Deny", x: x + 16, top: cy, tint: red, prominent: false)
-        let aw = pillButton(ctx, "Allow", x: x + 16 + dw + 8, top: cy, tint: green, prominent: true,
-                            highlight: t >= 6.9 && t < 7.3)
-        _ = pillButton(ctx, "Ask in Cursor", x: x + 16 + dw + 8 + aw + 8, top: cy,
-                       tint: cursorTint, prominent: false)
+        _ = pillButton(ctx, "Allow", x: x + 16 + dw + 8, top: cy, tint: green, prominent: true,
+                       highlight: t >= 6.9 && t < 7.3)
         text(ctx, "⌘Y / ⌘N", x + w - 16 - tw("⌘Y / ⌘N", size: 9, mono: true), cy + 8, size: 9, color: textTertiary, mono: true)
         ctx.restoreGState()
     }

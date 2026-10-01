@@ -30,9 +30,6 @@ struct SettingsView: View {
     private var groups: some View {
         VStack(alignment: .leading, spacing: 22) {
             integrationGroup
-            codexGroup
-            geminiGroup
-            cursorGroup
             behaviourGroup
             soundGroup
             aboutGroup
@@ -83,7 +80,7 @@ struct SettingsView: View {
     // MARK: - Claude Code
 
     private var integrationGroup: some View {
-        SettingsGroup("Claude Code", agent: .claude) {
+        SettingsGroup("Claude Code") {
             VStack(alignment: .leading, spacing: 0) {
                 // Status row: a lamp, the state, and the primary action.
                 HStack(spacing: 10) {
@@ -179,315 +176,6 @@ struct SettingsView: View {
         case .drifted(let reason): return reason
         case .settingsUnreadable(let reason): return reason
         }
-    }
-
-    // MARK: - Codex
-
-    @State private var codexError: String?
-    @State private var confirmingCodexRemoval = false
-
-    private var codexGroup: some View {
-        SettingsGroup("Codex", agent: .codex) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(codexColor)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: codexColor.opacity(0.7), radius: 3)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(codexTitle)
-                            .font(AndonTheme.body(13, weight: .medium))
-                            .foregroundStyle(AndonTheme.textPrimary)
-                        if let sub = codexSubtitle {
-                            Text(sub)
-                                .font(AndonTheme.body(11))
-                                .foregroundStyle(AndonTheme.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if app.isCodexInstalled {
-                        Button("Remove") { confirmingCodexRemoval = true }
-                            .buttonStyle(AndonButtonStyle(tint: AndonTheme.red))
-                    } else {
-                        Button("Set up") { installCodex() }
-                            .buttonStyle(AndonButtonStyle(
-                                tint: AndonTheme.agentTint(.codex), prominent: true))
-                    }
-                }
-                .padding(14)
-
-                if let codexError {
-                    RowDivider()
-                    Text(codexError)
-                        .font(AndonTheme.body(11))
-                        .foregroundStyle(AndonTheme.red)
-                        .padding(14)
-                }
-            }
-        } footer: {
-            "Adds hooks to ~/.codex/hooks.json — separate from config.toml, so your "
-                + "existing Codex settings and notify command are left untouched."
-        }
-        .alert("Remove AndonCord's Codex hooks?", isPresented: $confirmingCodexRemoval) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove", role: .destructive) { removeCodex() }
-        } message: {
-            Text("Codex will stop reporting to the board. Your other Codex hooks, if "
-                 + "any, are left in place.")
-        }
-    }
-
-    private var codexColor: Color {
-        switch app.codexStatus {
-        case .installed: return AndonTheme.green
-        case .notInstalled: return AndonTheme.inactive
-        case .drifted: return AndonTheme.amber
-        case .fileUnreadable: return AndonTheme.red
-        }
-    }
-
-    private var codexTitle: String {
-        switch app.codexStatus {
-        case .installed: return "Connected"
-        case .notInstalled: return "Not set up"
-        case .drifted: return "Needs repair"
-        case .fileUnreadable: return "Can't read hooks.json"
-        }
-    }
-
-    private var codexSubtitle: String? {
-        switch app.codexStatus {
-        case .installed:
-            return app.codexInstaller.hooksFeatureDisabled()
-                ? "Installed, but hooks are disabled in config.toml — set [features] hooks = true."
-                : "Codex is reporting to the board."
-        case .notInstalled: return "Watch Codex sessions alongside Claude Code."
-        case .drifted(let reason): return reason
-        case .fileUnreadable(let reason): return reason
-        }
-    }
-
-    private func installCodex() {
-        codexError = nil
-        if case .failure(let error) = app.installCodex() { codexError = error.localizedDescription }
-    }
-
-    private func removeCodex() {
-        codexError = nil
-        if case .failure(let error) = app.removeCodex() { codexError = error.localizedDescription }
-    }
-
-    // MARK: - Gemini
-
-    @State private var geminiError: String?
-    @State private var confirmingGeminiRemoval = false
-
-    private var geminiGroup: some View {
-        SettingsGroup("Gemini CLI", agent: .gemini) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(geminiColor)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: geminiColor.opacity(0.7), radius: 3)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(geminiTitle)
-                            .font(AndonTheme.body(13, weight: .medium))
-                            .foregroundStyle(AndonTheme.textPrimary)
-                        if let sub = geminiSubtitle {
-                            Text(sub)
-                                .font(AndonTheme.body(11))
-                                .foregroundStyle(AndonTheme.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if app.isGeminiInstalled {
-                        Button("Remove") { confirmingGeminiRemoval = true }
-                            .buttonStyle(AndonButtonStyle(tint: AndonTheme.red))
-                    } else {
-                        Button("Set up") { installGemini() }
-                            .buttonStyle(AndonButtonStyle(
-                                tint: AndonTheme.agentTint(.gemini), prominent: true))
-                    }
-                }
-                .padding(14)
-
-                if let geminiError {
-                    RowDivider()
-                    Text(geminiError)
-                        .font(AndonTheme.body(11))
-                        .foregroundStyle(AndonTheme.red)
-                        .padding(14)
-                }
-            }
-        } footer: {
-            "Watch-only: Gemini's hooks can announce an approval but not answer it, "
-                + "so the board alerts you and jump takes you to the terminal to decide."
-        }
-        .alert("Remove AndonCord's Gemini hooks?", isPresented: $confirmingGeminiRemoval) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove", role: .destructive) { removeGemini() }
-        } message: {
-            Text("Gemini CLI will stop reporting to the board. Any other hooks in "
-                 + "~/.gemini/settings.json are left in place.")
-        }
-    }
-
-    private var geminiColor: Color {
-        switch app.geminiStatus {
-        case .installed: return AndonTheme.green
-        case .notInstalled: return AndonTheme.inactive
-        case .drifted: return AndonTheme.amber
-        case .fileUnreadable: return AndonTheme.red
-        }
-    }
-
-    private var geminiTitle: String {
-        switch app.geminiStatus {
-        case .installed: return "Connected"
-        case .notInstalled: return "Not set up"
-        case .drifted: return "Needs repair"
-        case .fileUnreadable: return "Can't read settings.json"
-        }
-    }
-
-    private var geminiSubtitle: String? {
-        switch app.geminiStatus {
-        case .installed: return "Gemini CLI is reporting to the board."
-        case .notInstalled: return "Watch Gemini sessions alongside the others."
-        case .drifted(let reason): return reason
-        case .fileUnreadable(let reason): return reason
-        }
-    }
-
-    private func installGemini() {
-        geminiError = nil
-        if case .failure(let error) = app.installGemini() { geminiError = error.localizedDescription }
-    }
-
-    private func removeGemini() {
-        geminiError = nil
-        if case .failure(let error) = app.removeGemini() { geminiError = error.localizedDescription }
-    }
-
-    // MARK: - Cursor
-
-    @State private var cursorError: String?
-    @State private var confirmingCursorRemoval = false
-
-    private var cursorGroup: some View {
-        SettingsGroup("Cursor", agent: .cursor) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(cursorColor)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: cursorColor.opacity(0.7), radius: 3)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(cursorTitle)
-                            .font(AndonTheme.body(13, weight: .medium))
-                            .foregroundStyle(AndonTheme.textPrimary)
-                        if let sub = cursorSubtitle {
-                            Text(sub)
-                                .font(AndonTheme.body(11))
-                                .foregroundStyle(AndonTheme.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if app.isCursorInstalled {
-                        Button("Remove") { confirmingCursorRemoval = true }
-                            .buttonStyle(AndonButtonStyle(tint: AndonTheme.red))
-                    } else {
-                        Button("Set up") { installCursor() }
-                            .buttonStyle(AndonButtonStyle(
-                                tint: AndonTheme.agentTint(.cursor), prominent: true))
-                    }
-                }
-                .padding(14)
-
-                if app.isCursorInstalled {
-                    RowDivider()
-                    ToggleRow(
-                        "Gate shell commands in the notch",
-                        detail: "Every Cursor shell command waits here for Allow / Deny / "
-                            + "Ask in Cursor — including allowlisted ones. Off means "
-                            + "watch-only.",
-                        isOn: Binding(
-                            get: { app.settings.cursorGateEnabled },
-                            set: { app.setCursorGate($0) }))
-                }
-
-                if let cursorError {
-                    RowDivider()
-                    Text(cursorError)
-                        .font(AndonTheme.body(11))
-                        .foregroundStyle(AndonTheme.red)
-                        .padding(14)
-                }
-            }
-        } footer: {
-            "Adds entries to ~/.cursor/hooks.json (hot-reloaded by Cursor). Requires a "
-                + "2026 cursor-agent — run `cursor-agent update` if sessions don't appear."
-        }
-        .alert("Remove AndonCord's Cursor hooks?", isPresented: $confirmingCursorRemoval) {
-            Button("Cancel", role: .cancel) {}
-            Button("Remove", role: .destructive) { removeCursor() }
-        } message: {
-            Text("Cursor will stop reporting to the board. Any other entries in "
-                 + "hooks.json are left in place.")
-        }
-    }
-
-    private var cursorColor: Color {
-        switch app.cursorStatus {
-        case .installed: return AndonTheme.green
-        case .notInstalled: return AndonTheme.inactive
-        case .drifted: return AndonTheme.amber
-        case .fileUnreadable: return AndonTheme.red
-        }
-    }
-
-    private var cursorTitle: String {
-        switch app.cursorStatus {
-        case .installed: return "Connected"
-        case .notInstalled: return "Not set up"
-        case .drifted: return "Needs repair"
-        case .fileUnreadable: return "Can't read hooks.json"
-        }
-    }
-
-    private var cursorSubtitle: String? {
-        switch app.cursorStatus {
-        case .installed:
-            return app.settings.cursorGateEnabled
-                ? "Watching, and gating shell commands through the notch."
-                : "Watching Cursor sessions. Shell gate is off."
-        case .notInstalled: return "Watch Cursor sessions; optionally gate shell commands."
-        case .drifted(let reason): return reason
-        case .fileUnreadable(let reason): return reason
-        }
-    }
-
-    private func installCursor() {
-        cursorError = nil
-        if case .failure(let error) = app.installCursor() { cursorError = error.localizedDescription }
-    }
-
-    private func removeCursor() {
-        cursorError = nil
-        if case .failure(let error) = app.removeCursor() { cursorError = error.localizedDescription }
     }
 
     // MARK: - Behaviour
@@ -752,39 +440,28 @@ struct SettingsView: View {
 /// optional footnote — the macOS System Settings idiom.
 private struct SettingsGroup<Content: View>: View {
     let title: String
-    let agent: AgentSource?
     let footer: String?
     @ViewBuilder let content: Content
 
-    init(_ title: String, agent: AgentSource? = nil,
-         @ViewBuilder content: () -> Content, footer: () -> String) {
+    init(_ title: String, @ViewBuilder content: () -> Content, footer: () -> String) {
         self.title = title
-        self.agent = agent
         self.content = content()
         self.footer = footer()
     }
 
-    init(_ title: String, agent: AgentSource? = nil, @ViewBuilder content: () -> Content) {
+    init(_ title: String, @ViewBuilder content: () -> Content) {
         self.title = title
-        self.agent = agent
         self.content = content()
         self.footer = nil
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 5) {
-                if let glyph = agent?.glyph {
-                    GlyphShape(cgPath: glyph)
-                        .fill(AndonTheme.textTertiary)
-                        .frame(width: 10, height: 10)
-                }
-                Text(title.uppercased())
-                    .font(AndonTheme.label(10))
-                    .tracking(1.1)
-                    .foregroundStyle(AndonTheme.textTertiary)
-            }
-            .padding(.leading, 2)
+            Text(title.uppercased())
+                .font(AndonTheme.label(10))
+                .tracking(1.1)
+                .foregroundStyle(AndonTheme.textTertiary)
+                .padding(.leading, 2)
 
             VStack(spacing: 0) { content }
                 .frame(maxWidth: .infinity, alignment: .leading)

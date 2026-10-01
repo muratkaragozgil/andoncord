@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import AndonKit
 
@@ -158,35 +159,53 @@ final class RoundTripTests: XCTestCase {
                       "no decision means Claude Code asks in the terminal instead")
     }
 
-    @MainActor
-    func testCodexSourcedHookTagsTheSessionAsCodex() async throws {
-        let board = BoardStore()
-        server = HookServer()
-        server.onEvent = { envelope, decision in
-            MainActor.assumeIsolated { board.apply(envelope, decision: decision) }
-        }
-        try server.start()
+    func testHooksLeftInOtherAgentsNeverReachTheApp() throws {
+        // 0.1.x wrote these into ~/.codex, ~/.gemini and ~/.cursor, and only
+        // the user can take them out again. Nothing answers on this socket, so
+        // a shim that connected anyway — blocking ones especially — would sit
+        // here until the deadline instead of exiting.
+        let listener = try listenWithoutAnswering()
+        defer { close(listener) }
 
-        // Same shim, same socket — only the --source arg differs.
         let payload = """
-        {"session_id":"cx-1","cwd":"/tmp/proj","hook_event_name":"UserPromptSubmit",\
-        "user_message":"add a test"}
+        {"session_id":"stale-1","hook_event_name":"PreToolUse","tool_name":"Bash"}
         """
-        let (process, _) = try launchHook(payload: payload, blocking: false, source: "codex")
-        process.waitUntilExit()
+        for (source, blocking) in [("codex", false), ("gemini", false), ("cursor", true)] {
+            let (process, stdout) = try launchHook(payload: payload, blocking: blocking, source: source)
+            guard waitForExit(process, within: 5) else {
+                XCTFail("--source \(source) must not wait on anything")
+                continue
+            }
+            XCTAssertEqual(process.terminationStatus, 0, "--source \(source) must exit cleanly")
+            XCTAssertTrue(stdout.fileHandleForReading.readDataToEndOfFile().isEmpty,
+                          "--source \(source) must print nothing — output is a decision")
+        }
+        XCTAssertFalse(pendingConnection(on: listener), "a stale hook reached the app")
 
-        try await waitUntil("codex session created") { board.session(id: "cx-1") != nil }
-        XCTAssertEqual(board.session(id: "cx-1")?.agent, .codex,
-                       "a --source codex hook must tag its session as Codex")
+        // The control: Claude's own hook, untagged, on the same socket.
+        let (claude, _) = try launchHook(payload: payload, blocking: false)
+        _ = waitForExit(claude, within: 5)
+        XCTAssertTrue(pendingConnection(on: listener), "Claude Code's hook must still connect")
+    }
 
-        // And a Claude hook on the same socket stays Claude — the two coexist.
-        let (p2, _) = try launchHook(
-            payload: #"{"session_id":"cc-1","hook_event_name":"UserPromptSubmit","user_message":"x"}"#,
-            blocking: false, source: "claude")
-        p2.waitUntilExit()
-        try await waitUntil("claude session created") { board.session(id: "cc-1") != nil }
-        XCTAssertEqual(board.session(id: "cc-1")?.agent, .claude)
-        XCTAssertEqual(board.sessions.count, 2, "both agents on one board")
+    func testCursorRunningClaudesHooksNeverReachesTheApp() throws {
+        // Cursor imports ~/.claude/settings.json, so it runs the very entries
+        // written for Claude — untagged — with its own payload. The session_id
+        // is there because that alone would be enough to put it on the board.
+        let listener = try listenWithoutAnswering()
+        defer { close(listener) }
+
+        let payload = """
+        {"conversation_id":"conv-1","cursor_version":"2.4","hook_event_name":"preToolUse",\
+        "tool_name":"Shell","session_id":"conv-1"}
+        """
+        let (process, stdout) = try launchHook(payload: payload, blocking: true)
+        guard waitForExit(process, within: 5) else {
+            return XCTFail("Cursor must never be held by our hook")
+        }
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(stdout.fileHandleForReading.readDataToEndOfFile().isEmpty)
+        XCTAssertFalse(pendingConnection(on: listener), "a Cursor session reached the app")
     }
 
     func testShimFailsOpenWhenNothingIsListening() throws {
@@ -228,6 +247,31 @@ final class RoundTripTests: XCTestCase {
 
         try await waitUntil("session created") { board.session(id: "rt-4") != nil }
         XCTAssertEqual(board.session(id: "rt-4")?.title, "hello there")
+    }
+
+    /// A bare listening socket at the app's address, with nothing behind it
+    /// that answers. Reading its accept queue directly is what tells "never
+    /// connected" apart from "connected, and the app ignored it".
+    private func listenWithoutAnswering() throws -> Int32 {
+        try Paths.ensureDirectories()
+        let fd = try SocketTransport.listen(at: Paths.socket.path)
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        return fd
+    }
+
+    private func pendingConnection(on listener: Int32) -> Bool {
+        let fd = accept(listener, nil, nil)
+        guard fd >= 0 else { return false }
+        close(fd)
+        return true
+    }
+
+    /// `waitUntilExit` with a ceiling, so a shim that wrongly blocks fails the
+    /// test rather than hanging the suite.
+    private func waitForExit(_ process: Process, within timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline { usleep(10_000) }
+        return !process.isRunning
     }
 
     /// Poll until a condition holds, so tests do not depend on fixed sleeps.

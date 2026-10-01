@@ -27,9 +27,6 @@ final class AppState {
     let anthropicUsage = AnthropicUsageStore()
     let settings = AndonSettings()
     let installer = ClaudeSettingsInstaller()
-    let codexInstaller = CodexHooksInstaller()
-    let geminiInstaller = GeminiHooksInstaller()
-    let cursorInstaller = CursorHooksInstaller()
 
     @ObservationIgnored
     private let server = HookServer()
@@ -39,9 +36,6 @@ final class AppState {
     /// Surfaced in the menu bar and settings so a broken install is visible
     /// rather than presenting as "the app just doesn't work".
     private(set) var installStatus: ClaudeSettingsInstaller.Status = .notInstalled
-    private(set) var codexStatus: CodexHooksInstaller.Status = .notInstalled
-    private(set) var geminiStatus: GeminiHooksInstaller.Status = .notInstalled
-    private(set) var cursorStatus: CursorHooksInstaller.Status = .notInstalled
     private(set) var serverError: String?
     /// Set when another copy of the app already owns the socket.
     private(set) var duplicateInstancePID: pid_t?
@@ -370,105 +364,11 @@ final class AppState {
 
     func refreshInstallStatus() {
         installStatus = installer.currentStatus()
-        codexStatus = codexInstaller.currentStatus()
-        geminiStatus = geminiInstaller.currentStatus()
-        cursorStatus = cursorInstaller.currentStatus(gateEnabled: settings.cursorGateEnabled)
     }
 
     var isIntegrationHealthy: Bool {
         if case .installed = installStatus { return serverError == nil }
         return false
-    }
-
-    var isCodexInstalled: Bool {
-        if case .installed = codexStatus { return true }
-        return false
-    }
-
-    @discardableResult
-    func installCodex() -> Result<CodexHooksInstaller.Report, Error> {
-        do {
-            let report = try codexInstaller.install()
-            refreshInstallStatus()
-            return .success(report)
-        } catch {
-            AndonLog.ui.error("Codex install failed: \(error.localizedDescription)")
-            return .failure(error)
-        }
-    }
-
-    @discardableResult
-    func removeCodex() -> Result<URL?, Error> {
-        do {
-            let backup = try codexInstaller.uninstall()
-            refreshInstallStatus()
-            return .success(backup)
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    var isGeminiInstalled: Bool {
-        if case .installed = geminiStatus { return true }
-        return false
-    }
-
-    @discardableResult
-    func installGemini() -> Result<GeminiHooksInstaller.Report, Error> {
-        do {
-            let report = try geminiInstaller.install()
-            refreshInstallStatus()
-            return .success(report)
-        } catch {
-            AndonLog.ui.error("Gemini install failed: \(error.localizedDescription)")
-            return .failure(error)
-        }
-    }
-
-    @discardableResult
-    func removeGemini() -> Result<URL?, Error> {
-        do {
-            let backup = try geminiInstaller.uninstall()
-            refreshInstallStatus()
-            return .success(backup)
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    var isCursorInstalled: Bool {
-        if case .installed = cursorStatus { return true }
-        return false
-    }
-
-    @discardableResult
-    func installCursor() -> Result<CursorHooksInstaller.Report, Error> {
-        do {
-            let report = try cursorInstaller.install(gateEnabled: settings.cursorGateEnabled)
-            refreshInstallStatus()
-            return .success(report)
-        } catch {
-            AndonLog.ui.error("Cursor install failed: \(error.localizedDescription)")
-            return .failure(error)
-        }
-    }
-
-    @discardableResult
-    func removeCursor() -> Result<URL?, Error> {
-        do {
-            let backup = try cursorInstaller.uninstall()
-            refreshInstallStatus()
-            return .success(backup)
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    /// Flip the shell gate and rewrite the hooks file to match. Cursor
-    /// hot-reloads hooks.json, so the change takes effect without a restart.
-    func setCursorGate(_ enabled: Bool) {
-        settings.cursorGateEnabled = enabled
-        if isCursorInstalled { installCursor() }
     }
 
     @discardableResult
