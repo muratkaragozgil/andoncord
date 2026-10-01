@@ -9,7 +9,7 @@ Approve tool calls, answer questions, and review plans — without leaving your 
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-black)
 ![Swift](https://img.shields.io/badge/swift-6.0-F05138)
-![Tests](https://img.shields.io/badge/tests-93%20passing-3FB950)
+![Tests](https://img.shields.io/badge/tests-140%20passing-3FB950)
 ![Privacy](https://img.shields.io/badge/telemetry-none-blue)
 [![Release](https://img.shields.io/github/v/release/MuratKaragozgil/andoncord?color=E8A33D&label=release)](https://github.com/MuratKaragozgil/andoncord/releases/latest)
 
@@ -298,7 +298,7 @@ drift from the palette the board uses.
 
 ```bash
 swift build --product andon-hook   # RoundTripTests spawn the real shim
-swift test                         # 93 tests
+swift test                         # 140 tests; two run only against real data (ANDON_SCAN_REAL, ANDON_REAL_SETTINGS)
 ./build.sh dmg                     # the release artifact: a universal drag-to-install image
 ```
 
