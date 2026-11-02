@@ -30,4 +30,19 @@ public struct StatuslineChain: Codable, Sendable {
         self.refreshInterval = refreshInterval
         self.wasAbsent = wasAbsent
     }
+
+    /// The command to hand the payload on to, or nil when there is none —
+    /// or when it is AndonCord's own statusline. A chain that leads back to
+    /// itself starts a copy of itself on every redraw, each of which starts
+    /// another; another notch app shipped exactly that and forked thousands
+    /// of processes. The installer never records itself, but a chain file is
+    /// only a file, and this is the last place it can be caught.
+    public var forwardCommand: String? {
+        guard let command, !command.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        guard !command.contains("andon-statusline"),
+              !command.contains(ClaudeSettingsInstaller.marker),
+              !command.contains("AndonCord.app/Contents/MacOS/andon-hook")
+        else { return nil }
+        return command
+    }
 }

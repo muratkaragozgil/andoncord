@@ -211,6 +211,112 @@ final class TranscriptScannerTests: XCTestCase {
         XCTAssertEqual(session.projectPath, "/work/proj")
         XCTAssertEqual(session.projectName, "proj")
     }
+
+    // MARK: - Resuming
+
+    /// A live transcript is read on from where the last pass stopped. That is
+    /// only allowed if it lands on exactly the numbers a read from the top
+    /// would — including a response whose lines straddle the two passes.
+    func testResumingFromACheckpointMatchesAFullScan() throws {
+        let first = [
+            prompt("first", id: "p1", at: "2026-08-25T10:00:00.000Z"),
+            assistant(messageId: "msg_1", at: "2026-08-25T10:00:01.000Z", output: 100,
+                      content: #"[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/work/proj/a.swift"}}]"#),
+        ]
+        let second = [
+            #"{"type":"user","timestamp":"2026-08-25T10:00:02.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"\#(String(repeating: "x", count: 4_000))"}]}}"#,
+            assistant(messageId: "msg_1", at: "2026-08-25T10:00:03.000Z", output: 100),
+            assistant(messageId: "msg_2", at: "2026-08-25T10:00:04.000Z", output: 250),
+            prompt("second", id: "p2", at: "2026-08-25T11:00:00.000Z"),
+            assistant(messageId: "msg_3", at: "2026-08-25T11:00:01.000Z", output: 900),
+        ]
+        let url = sandbox.appendingPathComponent("live.jsonl")
+        try (first.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        let (_, checkpoint) = TranscriptScanner.scan(file: url, sessionId: "live", from: nil)
+        let resumeFrom = try XCTUnwrap(checkpoint)
+        XCTAssertEqual(resumeFrom.offset, UInt64(try Data(contentsOf: url).count))
+
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((second.joined(separator: "\n") + "\n").utf8))
+        try handle.close()
+
+        let resumed = try XCTUnwrap(
+            TranscriptScanner.scan(file: url, sessionId: "live", from: resumeFrom).session)
+        let whole = try XCTUnwrap(TranscriptScanner.scan(file: url, sessionId: "live"))
+        XCTAssertEqual(resumed, whole)
+        XCTAssertEqual(resumed.usage.requests, 3)
+        XCTAssertEqual(resumed.usage.output, 1_250)
+        XCTAssertEqual(resumed.footprints.first?.key, "/work/proj/a.swift")
+    }
+
+    /// Claude Code may be halfway through writing the last line when a pass
+    /// runs. That line must not be skipped for good: the checkpoint stops
+    /// short of it, so the next pass reads it whole.
+    func testAHalfWrittenLastLineIsReadAgainOnceFinished() throws {
+        let complete = assistant(messageId: "msg_2", at: "2026-08-25T10:00:05.000Z", output: 250)
+        let url = sandbox.appendingPathComponent("partial.jsonl")
+        let head = [
+            prompt("go", id: "p1", at: "2026-08-25T10:00:00.000Z"),
+            assistant(messageId: "msg_1", at: "2026-08-25T10:00:01.000Z", output: 100),
+        ].joined(separator: "\n") + "\n"
+        try (head + complete.prefix(40)).write(to: url, atomically: true, encoding: .utf8)
+
+        let (partial, checkpoint) = TranscriptScanner.scan(file: url, sessionId: "p", from: nil)
+        XCTAssertEqual(partial?.usage.output, 100)
+        XCTAssertEqual(checkpoint?.offset, UInt64(Data(head.utf8).count))
+
+        try (head + complete + "\n").write(to: url, atomically: true, encoding: .utf8)
+        let finished = TranscriptScanner.scan(file: url, sessionId: "p", from: checkpoint).session
+        XCTAssertEqual(finished?.usage.output, 350)
+    }
+
+    /// An unterminated final line that is complete still counts on the pass
+    /// that sees it.
+    func testAnUnterminatedFinalLineStillCounts() throws {
+        let url = try write([
+            prompt("go", id: "p1", at: "2026-08-25T10:00:00.000Z"),
+            assistant(messageId: "msg_1", at: "2026-08-25T10:00:01.000Z", output: 70),
+        ])
+        XCTAssertEqual(TranscriptScanner.scan(file: url)?.usage.output, 70)
+    }
+
+    func testLinesLongerThanAChunkSurviveIntact() throws {
+        let long = String(repeating: "y", count: 3 << 20)
+        let url = sandbox.appendingPathComponent("long.txt")
+        try "a\n\(long)\nb\n\nc".write(to: url, atomically: true, encoding: .utf8)
+
+        let reader = try XCTUnwrap(LineReader(url: url))
+        var lines: [Data] = []
+        let tail = reader.forEachLine { lines.append($0) }
+        XCTAssertEqual(lines.map(\.count), [1, long.utf8.count, 1])
+        XCTAssertEqual(String(decoding: tail, as: UTF8.self), "c")
+        XCTAssertEqual(reader.consumedOffset, UInt64(2 + long.utf8.count + 1 + 2 + 1))
+    }
+
+    // MARK: - Dates
+
+    func testTimestampsParseLikeTheFormatterDid() throws {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        for stamp in [
+            "2026-11-02T16:21:33.123Z", "2026-02-28T23:59:59.999Z", "2024-02-29T00:00:00.000Z",
+            "2000-01-01T00:00:00.5Z", "1999-12-31T12:30:45.000001Z",
+        ] {
+            let fast = try XCTUnwrap(TranscriptDate.parseUTC(stamp), stamp)
+            let reference = try XCTUnwrap(formatter.date(from: stamp), stamp)
+            XCTAssertEqual(fast.timeIntervalSince1970, reference.timeIntervalSince1970,
+                           accuracy: 0.001, stamp)
+        }
+        XCTAssertEqual(
+            TranscriptDate.parseUTC("2026-11-02T16:21:33Z")?.timeIntervalSince1970,
+            ISO8601DateFormatter().date(from: "2026-11-02T16:21:33Z")?.timeIntervalSince1970)
+        // Anything else is left to the formatters.
+        XCTAssertNil(TranscriptDate.parseUTC("2026-11-02T16:21:33+03:00"))
+        XCTAssertNil(TranscriptDate.parseUTC("2026-13-02T16:21:33Z"))
+        XCTAssertNotNil(TranscriptDate.parse("2026-11-02T16:21:33+03:00"))
+    }
 }
 
 /// Forecast arithmetic.

@@ -196,6 +196,26 @@ struct SettingsView: View {
                     isOn: bind(\.hideWhenIdle))
                 RowDivider()
                 ToggleRow(
+                    "Hide over fullscreen apps",
+                    detail: "Gets out of the way of a video, a presentation or a game on the board's display. ⌃⌥B still brings it up.",
+                    isOn: bind(\.hideInFullscreen))
+                RowDivider()
+                ToggleRow(
+                    "Stay quiet when the session is in front",
+                    detail: "No chime and no pop-open when the session's own terminal or Claude window is the one you're looking at — it is showing the same prompt.",
+                    isOn: bind(\.quietWhenSessionInFront))
+                RowDivider()
+                ToggleRow(
+                    "Shortcuts from any app",
+                    detail: "⌃⌥Y allow · ⌃⌥N deny · ⌃⌥A always allow · ⌃⌥B show the board. With the card out of sight, the first press shows it and the next one acts.",
+                    isOn: Binding(
+                        get: { app.settings.globalShortcuts },
+                        set: {
+                            app.settings.globalShortcuts = $0
+                            app.applyShortcuts?()
+                        }))
+                RowDivider()
+                ToggleRow(
                     "Show usage limits",
                     detail: "The 5-hour and weekly windows, read from the Claude desktop app's own record — or Claude Code's statusline — and carried forward by measured spend between readings.",
                     isOn: bind(\.showUsage))

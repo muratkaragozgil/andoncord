@@ -9,7 +9,7 @@ Approve tool calls, answer questions, and review plans — without leaving your 
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-black)
 ![Swift](https://img.shields.io/badge/swift-6.0-F05138)
-![Tests](https://img.shields.io/badge/tests-140%20passing-3FB950)
+![Tests](https://img.shields.io/badge/tests-180%20passing-3FB950)
 ![Privacy](https://img.shields.io/badge/telemetry-none-blue)
 [![Release](https://img.shields.io/github/v/release/MuratKaragozgil/andoncord?color=E8A33D&label=release)](https://github.com/MuratKaragozgil/andoncord/releases/latest)
 
@@ -41,12 +41,14 @@ instead of just being announced.
 | | |
 |---|---|
 | 🖥️ **Watch** | Every session's live state — a bouncing equalizer while working, amber blink when it needs you, red when stopped. Elapsed time ticks in real time. |
-| ✅ **Answer** | Approve or deny tool calls (with the actual diff or command in front of you), answer `AskUserQuestion` prompts, review and revise plans — all from the notch. |
-| 🎯 **Jump** | Click a session to land in its exact terminal tab, split, or tmux pane. |
+| ✅ **Answer** | Approve or deny tool calls (with the actual diff or command in front of you), answer every question of an `AskUserQuestion` — multi-select and typed answers included — and approve plans or send them back, all from the notch. "Always allow" offers Claude Code's own *don't ask again* rules, so `npm test:*` means what it means in the terminal. The terminal's dialog stays live the whole time: answer wherever you are, and the other one clears. |
+| 🎯 **Jump** | Click a session to land in its exact terminal tab, split, or tmux pane — Ghostty 1.3 included. |
+| ⌨️ **Reach** | ⌃⌥Y allow · ⌃⌥N deny · ⌃⌥A always allow · ⌃⌥B show the board — from any app, no Accessibility permission. With the card out of sight, the first press shows it and only the next one acts. |
+| 💬 **Reply** | A finished session in tmux, iTerm2 or Ghostty takes its next prompt straight from its row. |
 | 📊 **Budget** | 5-hour and weekly rate-limit windows, read from Claude Code itself — and a straight answer to the question a percentage can't give you on its own: *will it last?* |
 | 🧾 **Account** | Where the tokens actually went — by project, by session, by prompt, by file. Read from Claude Code's own transcripts, which record every request and add up none of it. |
 | 🔊 **Hear** | Synthesized 8-bit cues, one per event, distinct enough to learn by ear. Replace any of them by dropping a `.wav` into `~/.andoncord/sounds`. |
-| 📺 **Place** | The board lives on the display you choose — the notched built-in screen or any external monitor (Settings → Display). |
+| 📺 **Place** | The board lives on the display you choose — the notched built-in screen or any external monitor (Settings → Display). It steps aside for a fullscreen app, and stays quiet for a session whose own window is already in front. |
 
 Everything is local. No account, no server, no telemetry, no network calls —
 unless you turn on **Exact usage from Anthropic** (below), which sends Claude
@@ -151,8 +153,11 @@ would cost at API list prices, since a subscription is not billed per token at
 all.
 
 The index is built once, cached in `~/.andoncord/usage-index.json`, and only
-re-reads files that changed. Nothing leaves the machine; the transcripts are
-opened read-only and never modified.
+re-reads files that changed — and of a live session's transcript, only the
+lines appended since the last pass, so a 200 MB conversation costs kilobytes
+per refresh rather than the whole file. The first index runs on half the
+cores, not all of them. Nothing leaves the machine; the transcripts are opened
+read-only and never modified.
 
 ## The lamp language
 
@@ -166,7 +171,10 @@ The board reads like an andon board — colour and motion first, text second:
 
 If it's green and moving, it's working. If it's red and still, it isn't.
 There is no state where a dead session can impersonate a live one: sessions
-whose process disappears are reaped by a real pid liveness check, not a timer.
+whose process disappears leave the board the moment it exits (a kernel exit
+watch on Claude Code's own process, with a liveness sweep behind it), and a
+turn stopped with Esc — which no hook reports — is read from the transcript,
+where Claude Code records it.
 
 ## Install
 
@@ -202,8 +210,14 @@ First launch walks you through setup. With your consent AndonCord will:
   timestamped backup of `settings.json` taken before every change
 
 **Settings → Remove** puts everything back exactly as it was; only entries
-carrying our marker are touched. Already-running Claude Code sessions need a
-restart before hooks apply.
+carrying our marker are touched. Claude Code picks up hook changes in running
+sessions on its own.
+
+> **Upgrading from 0.2.x:** the first launch rewrites AndonCord's own hook
+> entries to the 0.3 set — the blocking `PreToolUse` group goes, `PermissionDenied`
+> arrives — after the usual backup. Nothing else in `settings.json` is touched,
+> and a file with comments is left for **Repair** rather than rewritten behind
+> your back.
 
 > **Upgrading from 0.1.x:** earlier releases could also add hooks to Codex,
 > Gemini CLI, and Cursor. Those hooks are now inert — the shim sees they are
@@ -228,18 +242,31 @@ the terminal's environment variables. That is the only reliable way to learn
 *which tab* a session lives in; the hook payload itself carries no terminal
 information at all.
 
-**Approval works by blocking.** `PermissionRequest` hooks are registered with a
-24-hour timeout. The shim writes the request to the socket and blocks on
-`read()` — Claude Code is genuinely paused. When you click **Allow**, the
-decision travels back down the same connection, the shim prints it to stdout,
-and the turn resumes.
+**Approval works by blocking — next to Claude Code's own dialog, not instead
+of it.** `PermissionRequest` hooks are registered with a 24-hour timeout. The
+shim writes the request to the socket and blocks on `read()`. Claude Code shows
+its usual dialog at the same moment, in the terminal or the desktop app, and
+whichever answer comes first wins. When you click **Allow**, the decision
+travels back down the same connection, the shim prints it to stdout, and the
+other dialog closes.
 
-**Questions and plans ride the deny + reason channel.** A `PreToolUse` hook
-cannot return a tool result, but Claude Code feeds `permissionDecisionReason`
-back to the model. So answering a question is expressed as a denial whose
-reason is *"The user answered: Staging"* — the answer lands as ordinary tool
-feedback. No keystrokes injected into your terminal, no dependence on the TUI's
-internals.
+**Questions and plans are permission requests too.** `AskUserQuestion` and
+`ExitPlanMode` are tools that ask a person, so they arrive as an ordinary
+`PermissionRequest`. A question is answered by allowing the call with its own
+input plus an `answers` map (`updatedInput`), which is exactly what the
+terminal's question dialog does: the tool runs, and Claude reads the answers as
+its result. A plan is approved the same way, optionally with Claude Code's
+`setMode` update to start accepting edits; sending it back is a deny whose
+message is your feedback. No keystrokes injected into a terminal, no dependence
+on the TUI's internals — and since nothing waits in `PreToolUse` any more,
+nothing holds the terminal's own dialog back.
+
+**A card never outlives its question.** If you answer in the terminal, the
+tool call's result arrives with the same `tool_use_id` the request was matched
+to, and the card goes. If Claude Code kills the hook (Esc, an interrupt, the
+session dying), the parked connection hangs up and the card goes. A new prompt
+or the end of the turn settles whatever the session's own thread was still
+asking; a background subagent's request stays until it is answered.
 
 **Quota comes from the statusline.** `rate_limits` is exposed on Claude Code's
 statusline payload and nowhere else. Since only one statusline can be
@@ -252,8 +279,9 @@ The shim sits on your critical path, so every failure path exits `0` with no
 output — which Claude Code reads as "the hook had no opinion":
 
 - app not running → exit 0, Claude Code carries on
-- app dies mid-decision → hook released, Claude Code falls back to its own prompt
+- app dies mid-decision → hook released, Claude Code's own prompt carries on
 - session closed while a request is parked → hook released immediately
+- request answered in the terminal → hook released with no opinion, card withdrawn
 - run by anything other than Claude Code — a hook 0.1.x left in another
   agent's config, or Cursor running the ones in `~/.claude/settings.json` →
   exit 0 before the socket is ever touched
@@ -298,7 +326,7 @@ drift from the palette the board uses.
 
 ```bash
 swift build --product andon-hook   # RoundTripTests spawn the real shim
-swift test                         # 140 tests; two run only against real data (ANDON_SCAN_REAL, ANDON_REAL_SETTINGS)
+swift test                         # 180 tests; two run only against real data (ANDON_SCAN_REAL, ANDON_REAL_SETTINGS)
 ./build.sh dmg                     # the release artifact: a universal drag-to-install image
 ```
 
@@ -322,22 +350,38 @@ as text instead of guesswork.
 ## Known limits
 
 - **Precise jump** works for iTerm2, Terminal.app, WezTerm, kitty (remote
-  control on), and tmux. Ghostty, Warp, Alacritty, Hyper, Zed, and editor
-  terminals only get app activation — they expose no public tab-addressing
-  API, and the UI says "Click to raise" instead of pretending.
+  control on), tmux, and Ghostty 1.3+ (found by working directory — two
+  Ghostty terminals in the same directory are indistinguishable). Warp,
+  Alacritty, Hyper, Zed, and editor terminals only get app activation — they
+  expose no public tab-addressing API, and the UI says "Click to raise"
+  instead of pretending.
+- **MCP forms are shown, not answered.** Claude Code waits for `Elicitation`
+  hooks before it shows its own form, so a hook that held one would hide the
+  form until the notch answered. The board says which server is asking and
+  links its sign-in page; the answer is given in Claude.
 - Sessions hosted by the **Claude desktop app** have no terminal at all; they
   are identified by the launching bundle and a click raises Claude.
 - **Quota is exact only from Anthropic** — with *Exact usage from Anthropic*
   off, the figure is as current as the desktop app's record (open its usage
   tray once a day) or the last statusline, and between readings it is an
   estimate, marked `~`. `claude -p` never renders a statusline at all.
-- First precise jump prompts for **Automation** permission (iTerm2 /
-  Terminal.app only). Denying it degrades to app activation.
+- First precise jump or reply prompts for **Automation** permission (iTerm2,
+  Terminal.app, Ghostty). Denying it degrades to app activation.
 - No SSH-remote sessions, no auto-update.
 
 ## Credits
 
 Inspired by [Vibe Island](https://vibeisland.app), which supports 26 agents.
 AndonCord is the opposite bet: one agent, integrated as deeply as the hooks
-allow. Built with [Claude Code](https://claude.com/claude-code) — the tool it
+allow.
+
+0.3 learned from the open-source notch apps that took the same road —
+ideas, not code: [CodeIsland](https://github.com/wxtsky/CodeIsland) (system-wide
+card shortcuts, hiding over fullscreen apps, quiet when the session is in
+front, exit watches, `tool_use_id` withdrawal, the idle-compaction filter),
+[ping-island](https://github.com/erha19/ping-island) (interrupts from the
+transcript), [open-vibe-island](https://github.com/Octane0411/open-vibe-island)
+(Ghostty's AppleScript, replying from the notch, a statusline chain that must
+never call itself), and [coucou](https://github.com/Louis-CFM/coucou) (echoing
+Claude Code's own permission suggestions). Built with [Claude Code](https://claude.com/claude-code) — the tool it
 watches.

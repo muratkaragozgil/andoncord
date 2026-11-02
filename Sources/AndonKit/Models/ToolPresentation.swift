@@ -43,17 +43,61 @@ public struct ToolPresentation: Sendable, Equatable {
         }
     }
 
+    /// An `AskUserQuestion` call: one to four questions, answered together.
     public struct QuestionDetail: Sendable, Equatable {
+        /// Optional heading over the whole set.
+        public var title: String?
+        public var questions: [Question]
+    }
+
+    public struct Question: Sendable, Equatable, Identifiable {
+        public var id: String { question }
         public var header: String?
+        /// Also the key its answer is filed under.
         public var question: String
         public var options: [Option]
         public var multiSelect: Bool
+        /// Builds that can ask for typed input send `kind: "text"` or
+        /// `"number"` and no options; both are answered by typing.
+        public var expectsTypedAnswer: Bool
+        public var placeholder: String?
 
         public struct Option: Sendable, Equatable, Identifiable {
             public var id: String { label }
             public var label: String
             public var description: String?
         }
+    }
+
+    /// The input `AskUserQuestion` runs with once answered from the notch:
+    /// the call's own input, with `answers` filled in.
+    ///
+    /// `answers` maps each question's text to its answer. A multi-select
+    /// answer is its labels joined with ", ", any label that itself contains
+    /// ", " or a quote JSON-quoted — the encoding the tool splits on. A
+    /// question with no entry counts as skipped.
+    public static func answeredInput(
+        _ input: JSONValue?, answers: [String: [String]]
+    ) -> JSONValue {
+        var object = input?.objectValue ?? [:]
+        var encoded: [String: JSONValue] = [:]
+        // Quoted the way JavaScript's JSON.stringify quotes, slashes and all:
+        // the tool checks an answer by re-encoding the labels it split out.
+        let quoter = JSONEncoder()
+        quoter.outputFormatting = [.withoutEscapingSlashes]
+        for (question, labels) in answers {
+            let parts = labels
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !parts.isEmpty else { continue }
+            encoded[question] = .string(parts.map { label -> String in
+                guard label.contains(", ") || label.contains("\"") else { return label }
+                let data = (try? quoter.encode(label)) ?? Data(label.utf8)
+                return String(decoding: data, as: UTF8.self)
+            }.joined(separator: ", "))
+        }
+        object["answers"] = .object(encoded)
+        return .object(object)
     }
 
     public static func make(toolName: String, input: JSONValue?) -> ToolPresentation {
@@ -138,21 +182,34 @@ public struct ToolPresentation: Sendable, Equatable {
         }
     }
 
-    /// `AskUserQuestion` nests a `questions` array; we present the first one,
-    /// since the notch answers them one at a time.
+    /// `AskUserQuestion` nests up to four questions under `questions`, and
+    /// they are answered as a set: the tool runs once, with every answer.
     private static func parseQuestion(_ object: [String: JSONValue]) -> QuestionDetail {
-        let first = object["questions"]?.arrayValue?.first?.objectValue ?? object
-
-        let options = (first["options"]?.arrayValue ?? []).compactMap { entry -> QuestionDetail.Option? in
-            guard let fields = entry.objectValue,
-                  let label = fields["label"]?.stringValue else { return nil }
-            return .init(label: label, description: fields["description"]?.stringValue)
+        let entries = object["questions"]?.arrayValue?.compactMap(\.objectValue)
+            ?? [object]
+        let questions = entries.compactMap { fields -> Question? in
+            guard let text = fields["question"]?.stringValue, !text.isEmpty else { return nil }
+            let options = (fields["options"]?.arrayValue ?? []).compactMap { entry -> Question.Option? in
+                guard let option = entry.objectValue,
+                      let label = option["label"]?.stringValue else { return nil }
+                let description = option["description"]?.stringValue
+                return .init(label: label, description: description?.isEmpty == true ? nil : description)
+            }
+            let kind = fields["kind"]?.stringValue ?? "choice"
+            return Question(
+                header: fields["header"]?.stringValue,
+                question: text,
+                options: options,
+                multiSelect: fields["multiSelect"]?.boolValue ?? false,
+                expectsTypedAnswer: kind != "choice" || options.isEmpty,
+                placeholder: fields["placeholder"]?.stringValue)
         }
         return QuestionDetail(
-            header: first["header"]?.stringValue,
-            question: first["question"]?.stringValue ?? "Claude needs an answer",
-            options: options,
-            multiSelect: first["multiSelect"]?.boolValue ?? false)
+            title: object["title"]?.stringValue,
+            questions: questions.isEmpty
+                ? [Question(header: nil, question: "Claude needs an answer", options: [],
+                            multiSelect: false, expectsTypedAnswer: true, placeholder: nil)]
+                : questions)
     }
 
     // MARK: - Formatting helpers

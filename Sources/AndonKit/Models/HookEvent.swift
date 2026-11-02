@@ -20,6 +20,16 @@ public enum HookEventName: String, Codable, Sendable {
     case subagentStop = "SubagentStop"
     case preCompact = "PreCompact"
     case postCompact = "PostCompact"
+    /// Auto mode's classifier turned a tool call down. Nobody is asked, so
+    /// without this the board never learns it happened.
+    case permissionDenied = "PermissionDenied"
+    /// An MCP server asking the person for input — a form, or a sign-in
+    /// link. Registered passive: Claude Code waits for these hooks *before*
+    /// it shows its own form, so holding one would hide that form until the
+    /// notch was answered.
+    case elicitation = "Elicitation"
+    /// The same request, settled — however it was settled.
+    case elicitationResult = "ElicitationResult"
 
     /// Events where the hook is expected to hold the line open while a human
     /// decides. These get a long timeout and a synchronous response.
@@ -28,15 +38,14 @@ public enum HookEventName: String, Codable, Sendable {
     }
 }
 
-/// Tools whose `PreToolUse` we intercept synchronously because the notch can
-/// answer them better than the terminal can.
+/// Tools the notch answers itself rather than merely approving.
+///
+/// Both arrive as an ordinary `PermissionRequest`. Claude Code shows its own
+/// dialog for them at the same moment, so the person can answer in either
+/// place and the first answer wins.
 public enum InterceptedTool: String, Sendable, CaseIterable {
     case exitPlanMode = "ExitPlanMode"
     case askUserQuestion = "AskUserQuestion"
-
-    public static var matcherPattern: String {
-        allCases.map(\.rawValue).joined(separator: "|")
-    }
 }
 
 /// The common envelope Claude Code writes to a hook's stdin.
@@ -44,7 +53,9 @@ public enum InterceptedTool: String, Sendable, CaseIterable {
 /// Field names mirror the documented payload exactly. Everything is optional
 /// because the set of populated fields varies per event, and because the
 /// payload is versioned by Claude Code rather than by us — an unknown or
-/// missing field must never fail the decode and stall a hook.
+/// missing field must never fail the decode and stall a hook. Nor may a known
+/// one that changes type: each field is decoded on its own, so one of them
+/// growing into an object costs that field, not the event.
 public struct HookPayload: Codable, Sendable {
     public var sessionId: String?
     public var promptId: String?
@@ -59,16 +70,45 @@ public struct HookPayload: Codable, Sendable {
     public var toolName: String?
     public var toolInput: JSONValue?
     public var toolResponse: JSONValue?
+    /// On every tool event except `PermissionRequest`, which is why a request
+    /// is matched to its call through the `PreToolUse` before it.
+    public var toolUseId: String?
+    /// `PermissionRequest`: the "don't ask again" options Claude Code's own
+    /// dialog offers for this call, in the shape a decision hands back.
+    public var permissionSuggestions: [JSONValue]?
+    /// `PostToolUseFailure`: the user interrupted the call.
+    public var isInterrupt: Bool?
 
     // Notification
     public var notificationType: String?
     public var message: String?
+    public var title: String?
 
     // Lifecycle
     public var source: String?
     public var reason: String?
     public var model: JSONValue?
     public var sessionTitle: String?
+    /// `Stop`, `SubagentStop`, `StopFailure`: the text the turn ended on.
+    public var lastAssistantMessage: String?
+    /// `StopFailure`: the failure's type (`rate_limit`, `overloaded`, …).
+    /// `PostToolUseFailure`: the tool's error.
+    public var error: String?
+    public var errorDetails: String?
+    /// `Stop`: work still in flight when the turn ended — background agents,
+    /// shells, monitors. Empty when nothing is.
+    public var backgroundTasks: [JSONValue]?
+    /// `{"level": "xhigh"}` on models with an effort setting.
+    public var effort: JSONValue?
+
+    // Elicitation
+    public var mcpServerName: String?
+    /// `form` or `url`.
+    public var mode: String?
+    public var url: String?
+    public var elicitationId: String?
+    /// `ElicitationResult`: `accept`, `decline` or `cancel`.
+    public var action: String?
 
     // UserPromptSubmit
     public var userMessage: String?
@@ -90,14 +130,68 @@ public struct HookPayload: Codable, Sendable {
         case toolName = "tool_name"
         case toolInput = "tool_input"
         case toolResponse = "tool_response"
+        case toolUseId = "tool_use_id"
+        case permissionSuggestions = "permission_suggestions"
+        case isInterrupt = "is_interrupt"
         case notificationType = "notification_type"
         case message
+        case title
         case source
         case reason
         case model
         case sessionTitle = "session_title"
+        case lastAssistantMessage = "last_assistant_message"
+        case error
+        case errorDetails = "error_details"
+        case backgroundTasks = "background_tasks"
+        case effort
+        case mcpServerName = "mcp_server_name"
+        case mode
+        case url
+        case elicitationId = "elicitation_id"
+        case action
         case userMessage = "user_message"
         case prompt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func field<T: Decodable>(_ key: CodingKeys) -> T? {
+            (try? c.decodeIfPresent(T.self, forKey: key)) ?? nil
+        }
+        sessionId = field(.sessionId)
+        promptId = field(.promptId)
+        transcriptPath = field(.transcriptPath)
+        cwd = field(.cwd)
+        permissionMode = field(.permissionMode)
+        hookEventName = field(.hookEventName)
+        agentId = field(.agentId)
+        agentType = field(.agentType)
+        toolName = field(.toolName)
+        toolInput = field(.toolInput)
+        toolResponse = field(.toolResponse)
+        toolUseId = field(.toolUseId)
+        permissionSuggestions = field(.permissionSuggestions)
+        isInterrupt = field(.isInterrupt)
+        notificationType = field(.notificationType)
+        message = field(.message)
+        title = field(.title)
+        source = field(.source)
+        reason = field(.reason)
+        model = field(.model)
+        sessionTitle = field(.sessionTitle)
+        lastAssistantMessage = field(.lastAssistantMessage)
+        error = field(.error)
+        errorDetails = field(.errorDetails)
+        backgroundTasks = field(.backgroundTasks)
+        effort = field(.effort)
+        mcpServerName = field(.mcpServerName)
+        mode = field(.mode)
+        url = field(.url)
+        elicitationId = field(.elicitationId)
+        action = field(.action)
+        userMessage = field(.userMessage)
+        prompt = field(.prompt)
     }
 
     public var event: HookEventName? {
@@ -116,6 +210,47 @@ public struct HookPayload: Codable, Sendable {
     /// different Claude Code versions have used for it.
     public var submittedPrompt: String? {
         userMessage ?? prompt ?? message
+    }
+
+    /// `effort.level`, when the model has one.
+    public var effortLevel: String? {
+        effort?["level"]?.stringValue ?? effort?.stringValue
+    }
+
+    /// Whether a `UserPromptSubmit` is something a person typed.
+    ///
+    /// The same event carries `/loop` wakeups, scheduled tasks, background
+    /// agents reporting in and messages from other sessions. `source` says
+    /// which, when the build sends it; when it does not, the prompt's own
+    /// machine-written markers are the fallback.
+    public var isTypedPrompt: Bool {
+        if let source { return source == "user" || source == "sdk" }
+        guard let text = submittedPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+        return !["<task-notification>", "<agent-message", "<system-reminder>",
+                 "<command-name>", "<local-command-stdout>"]
+            .contains { text.hasPrefix($0) }
+    }
+
+    /// A `StopFailure` as a person would put it.
+    public var failureDescription: String {
+        let kind: String
+        switch error {
+        case "rate_limit": kind = "Usage limit reached"
+        case "overloaded": kind = "API overloaded"
+        case "authentication_failed", "oauth_org_not_allowed": kind = "Signed out"
+        case "billing_error": kind = "Billing problem"
+        case "account_on_hold", "verification_required": kind = "Account needs attention"
+        case "max_output_tokens": kind = "Response too long"
+        case "model_not_found": kind = "Model unavailable"
+        case "server_error": kind = "API error"
+        case "invalid_request": kind = "Request rejected"
+        case let other?: kind = other.replacingOccurrences(of: "_", with: " ").capitalized
+        case nil: kind = message ?? "API error"
+        }
+        guard let details = errorDetails?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !details.isEmpty else { return kind }
+        return "\(kind): \(details)"
     }
 }
 
@@ -203,49 +338,48 @@ public struct HookResponse: Codable, Sendable {
     /// the flat `permissionDecision` used by `PreToolUse`.
     public struct Decision: Codable, Sendable {
         public var behavior: String
-        public var permissionRule: String?
+        /// Allow only. Replaces the tool's whole input — which is how a
+        /// question gets its answers: the tools that exist to ask a person
+        /// ignore an allow that carries no input of its own.
+        public var updatedInput: JSONValue?
+        /// Allow only. Permission updates for Claude Code to apply, in the
+        /// shape of the `permission_suggestions` it sent: echoing one back is
+        /// exactly what its own "don't ask again" option does.
+        public var updatedPermissions: [JSONValue]?
+        /// Deny only: what Claude is told.
         public var message: String?
+        /// Deny only: stop the turn as well.
+        public var interrupt: Bool?
 
-        public init(behavior: String, permissionRule: String? = nil, message: String? = nil) {
+        public init(
+            behavior: String, updatedInput: JSONValue? = nil,
+            updatedPermissions: [JSONValue]? = nil,
+            message: String? = nil, interrupt: Bool? = nil
+        ) {
             self.behavior = behavior
-            self.permissionRule = permissionRule
+            self.updatedInput = updatedInput
+            self.updatedPermissions = updatedPermissions
             self.message = message
+            self.interrupt = interrupt
         }
     }
 
-    /// Allow a single tool call.
-    public static func allowPermission() -> HookResponse {
-        HookResponse(hookSpecificOutput: .init(
-            hookEventName: HookEventName.permissionRequest.rawValue,
-            decision: .init(behavior: "allow")))
-    }
-
-    /// Allow, and persist a rule so this shape of call stops asking.
-    public static func allowPermission(rule: String) -> HookResponse {
-        HookResponse(hookSpecificOutput: .init(
-            hookEventName: HookEventName.permissionRequest.rawValue,
-            decision: .init(behavior: "allow", permissionRule: rule)))
-    }
-
-    public static func denyPermission(reason: String) -> HookResponse {
-        HookResponse(hookSpecificOutput: .init(
-            hookEventName: HookEventName.permissionRequest.rawValue,
-            decision: .init(behavior: "deny", message: reason)))
-    }
-
-    /// Used for the two `PreToolUse` tools we intercept.
-    ///
-    /// Answering a question or rejecting a plan is expressed as `deny` with the
-    /// human's words as the reason: Claude Code surfaces that reason back to
-    /// the model, so the answer lands as ordinary tool feedback and the turn
-    /// continues without a round trip through the terminal.
-    public static func preToolUse(
-        decision: String, reason: String? = nil
+    /// Allow the call, optionally with a replacement input and permission
+    /// updates (an "always allow", a mode change).
+    public static func allowPermission(
+        updatedInput: JSONValue? = nil, updatedPermissions: [JSONValue] = []
     ) -> HookResponse {
         HookResponse(hookSpecificOutput: .init(
-            hookEventName: HookEventName.preToolUse.rawValue,
-            permissionDecision: decision,
-            permissionDecisionReason: reason))
+            hookEventName: HookEventName.permissionRequest.rawValue,
+            decision: .init(
+                behavior: "allow", updatedInput: updatedInput,
+                updatedPermissions: updatedPermissions.isEmpty ? nil : updatedPermissions)))
+    }
+
+    public static func denyPermission(reason: String, interrupt: Bool = false) -> HookResponse {
+        HookResponse(hookSpecificOutput: .init(
+            hookEventName: HookEventName.permissionRequest.rawValue,
+            decision: .init(behavior: "deny", message: reason, interrupt: interrupt ? true : nil)))
     }
 
     public static let empty = HookResponse()

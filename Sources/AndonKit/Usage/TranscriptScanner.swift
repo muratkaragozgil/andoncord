@@ -34,22 +34,51 @@ public enum TranscriptScanner {
     static let maxTurns = 50
 
     public static func scan(file: URL, sessionId: String? = nil) -> SessionUsage? {
-        guard let reader = LineReader(url: file) else { return nil }
-        var state = ScanState(
+        scan(file: file, sessionId: sessionId, from: nil).session
+    }
+
+    /// How far a scan got through a transcript, and everything it had added up
+    /// by then.
+    ///
+    /// Claude Code only ever appends to a transcript, so a file that has grown
+    /// since can be read on from here rather than from the top. For a live
+    /// session that is the difference between re-reading two hundred
+    /// megabytes on every poll and reading the few kilobytes it gained.
+    struct Checkpoint: Sendable {
+        /// Byte offset just past the last complete line consumed.
+        let offset: UInt64
+        fileprivate let state: ScanState
+    }
+
+    /// The same scan, resumable: picks up at `checkpoint` when given one, and
+    /// hands back a checkpoint for the next pass to pick up from.
+    static func scan(
+        file: URL, sessionId: String?, from checkpoint: Checkpoint?
+    ) -> (session: SessionUsage?, checkpoint: Checkpoint?) {
+        guard let reader = LineReader(url: file, offset: checkpoint?.offset ?? 0) else {
+            return (nil, nil)
+        }
+        var state = checkpoint?.state ?? ScanState(
             id: sessionId ?? file.deletingPathExtension().lastPathComponent,
             transcriptPath: file.path)
 
-        reader.forEachLine { line in
+        let tail = reader.forEachLine { line in
             state.consume(line)
         }
+        let resumable = Checkpoint(offset: reader.consumedOffset, state: state)
 
-        return state.finish()
+        // Text after the last newline may be a line Claude Code is halfway
+        // through writing. It stays out of the checkpoint so the next pass
+        // reads it whole, but it still counts now, in case it was complete
+        // and merely unterminated.
+        if !tail.isEmpty { state.consume(tail) }
+        return (state.finish(), resumable)
     }
 }
 
 // MARK: - Scan state
 
-private struct ScanState {
+private struct ScanState: Sendable {
     let id: String
     let transcriptPath: String
 
@@ -130,7 +159,7 @@ private struct ScanState {
 
         guard let text = Self.promptText(from: content), !text.isEmpty else { return }
         let isSynthetic = (object["isMeta"] as? Bool == true) || Self.looksSynthetic(text)
-        let at = (object["timestamp"] as? String).flatMap(TranscriptDate.parse) ?? Date()
+        let at = lineDate ?? Date()
         // Namespaced by session: turn ids end up in one list across many
         // sessions, and the positional fallback would collide immediately.
         let turnId = (object["promptId"] as? String)
@@ -336,7 +365,7 @@ private struct ScanState {
 
 /// Running sums for one footprint. Carried cost needs the session's final
 /// request count, so it is resolved at the end rather than per event.
-private struct FootprintAccumulator {
+private struct FootprintAccumulator: Sendable {
     let tool: String
     let key: String
     var occurrences = 0
@@ -373,27 +402,14 @@ enum TranscriptMarkers {
 }
 
 extension Data {
-    /// Plain Boyer-Moore-less scan. The needles are short and the haystack is
-    /// read once, so the naive version is not the bottleneck — the JSON parse
-    /// this avoids is.
+    /// `memmem`, which is vectorised. The needles are short, but every line of
+    /// every transcript passes through here up to three times.
     func contains(subsequence needle: [UInt8]) -> Bool {
         guard !needle.isEmpty, count >= needle.count else { return false }
         return withUnsafeBytes { raw -> Bool in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
-            let limit = count - needle.count
-            let first = needle[0]
-            var index = 0
-            while index <= limit {
-                if base[index] == first {
-                    var matched = 1
-                    while matched < needle.count, base[index + matched] == needle[matched] {
-                        matched += 1
-                    }
-                    if matched == needle.count { return true }
-                }
-                index += 1
+            needle.withUnsafeBytes { pattern -> Bool in
+                memmem(raw.baseAddress, raw.count, pattern.baseAddress, pattern.count) != nil
             }
-            return false
         }
     }
 }
@@ -410,9 +426,68 @@ enum TranscriptDate {
     private static let lock = NSLock()
 
     static func parse(_ string: String) -> Date? {
+        if let date = parseUTC(string) { return date }
         lock.lock()
         defer { lock.unlock() }
         return fractional.date(from: string) ?? plain.date(from: string)
+    }
+
+    /// The one shape Claude Code writes, `2026-11-02T16:21:33.123Z`, read
+    /// without a formatter.
+    ///
+    /// Every relevant line carries a timestamp, so this runs millions of times
+    /// over a first index, and the formatters behind the lock serialised the
+    /// scans that are meant to run across every core. Anything else — an
+    /// offset, a missing `Z` — falls through to them.
+    static func parseUTC(_ string: String) -> Date? {
+        string.utf8.withContiguousStorageIfAvailable { bytes -> Date? in
+            guard bytes.count >= 20, bytes.last == UInt8(ascii: "Z"),
+                  bytes[4] == UInt8(ascii: "-"), bytes[7] == UInt8(ascii: "-"),
+                  bytes[10] == UInt8(ascii: "T"),
+                  bytes[13] == UInt8(ascii: ":"), bytes[16] == UInt8(ascii: ":")
+            else { return nil }
+
+            func number(_ range: Range<Int>) -> Int? {
+                var value = 0
+                for index in range {
+                    let digit = Int(bytes[index]) - 48
+                    guard (0...9).contains(digit) else { return nil }
+                    value = value * 10 + digit
+                }
+                return value
+            }
+            guard let year = number(0..<4), let month = number(5..<7), let day = number(8..<10),
+                  let hour = number(11..<13), let minute = number(14..<16),
+                  let second = number(17..<19),
+                  (1...12).contains(month), (1...31).contains(day),
+                  hour < 24, minute < 60, second < 61
+            else { return nil }
+
+            var fraction = 0.0
+            let end = bytes.count - 1
+            if end > 19 {
+                // Up to nine digits, read as an integer and scaled once so the
+                // result rounds the same way a formatter's would.
+                guard bytes[19] == UInt8(ascii: "."), end > 20, end - 20 <= 9,
+                      let digits = number(20..<end)
+                else { return nil }
+                var scale = 1.0
+                for _ in 20..<end { scale *= 10 }
+                fraction = Double(digits) / scale
+            }
+
+            // Days since 1970-01-01 in the proleptic Gregorian calendar
+            // (Howard Hinnant's `days_from_civil`).
+            let y = month <= 2 ? year - 1 : year
+            let era = (y >= 0 ? y : y - 399) / 400
+            let yearOfEra = y - era * 400
+            let dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+            let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+            let days = era * 146_097 + dayOfEra - 719_468
+
+            let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second
+            return Date(timeIntervalSince1970: Double(seconds) + fraction)
+        } ?? nil
     }
 }
 
@@ -420,32 +495,62 @@ enum TranscriptDate {
 
 /// Reads a file one line at a time without ever holding more than a chunk.
 ///
-/// Transcripts run to tens of megabytes; `String(contentsOf:)` on the largest
-/// of them would allocate the whole thing twice over just to split it.
+/// Transcripts run to hundreds of megabytes; `String(contentsOf:)` on the
+/// largest of them would allocate the whole thing twice over just to split it.
 final class LineReader {
     private let handle: FileHandle
     private let chunkSize = 1 << 20
-    private var buffer = Data()
+    /// Byte offset just past the last newline handed out, which is where a
+    /// later reader can start without seeing any line twice.
+    private(set) var consumedOffset: UInt64
 
-    init?(url: URL) {
+    init?(url: URL, offset: UInt64 = 0) {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        if offset > 0 {
+            do {
+                try handle.seek(toOffset: offset)
+            } catch {
+                try? handle.close()
+                return nil
+            }
+        }
         self.handle = handle
+        self.consumedOffset = offset
     }
 
     deinit { try? handle.close() }
 
-    func forEachLine(_ body: (Data) -> Void) {
-        let newline = UInt8(0x0A)
-        while true {
-            guard let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
+    /// Calls `body` with every complete line, then returns whatever followed
+    /// the last newline: nothing for a file that ends in one, otherwise a line
+    /// that may still be being written.
+    @discardableResult
+    func forEachLine(_ body: (Data) -> Void) -> Data {
+        var buffer = Data()
+        while let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            // What was carried over from the last chunk was searched then and
+            // holds no newline, so only the new bytes need looking at.
+            let carried = buffer.count
             buffer.append(chunk)
-            while let index = buffer.firstIndex(of: newline) {
-                let line = buffer[buffer.startIndex..<index]
-                if !line.isEmpty { body(Data(line)) }
-                buffer.removeSubrange(buffer.startIndex...index)
+            let consumed = buffer.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                var lineStart = 0
+                var searchFrom = carried
+                while searchFrom < raw.count,
+                      let hit = memchr(base + searchFrom, 0x0A, raw.count - searchFrom) {
+                    let end = base.distance(to: UnsafeRawPointer(hit))
+                    if end > lineStart { body(Data(bytes: base + lineStart, count: end - lineStart)) }
+                    lineStart = end + 1
+                    searchFrom = lineStart
+                }
+                return lineStart
             }
+            consumedOffset += UInt64(consumed)
+            // Compacted once per chunk. Dropping each line off the front as it
+            // was read moved every byte behind it, which made a chunk of short
+            // lines cost its length times its line count — on a first index,
+            // minutes of CPU spent on nothing but memmove.
+            buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + consumed))
         }
-        if !buffer.isEmpty { body(buffer) }
-        buffer.removeAll()
+        return buffer
     }
 }

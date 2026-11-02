@@ -67,12 +67,18 @@ public final class HookServer {
 
     /// Delivered on the main queue.
     public var onEvent: EventHandler?
+    /// Delivered on the main queue when the shim behind a parked decision
+    /// hangs up before anyone answered — Claude Code killed the hook. Carries
+    /// the decision's id; the decision itself has already been released.
+    public var onWithdrawn: ((UUID) -> Void)?
 
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private let acceptQueue = DispatchQueue(label: "app.andoncord.accept", qos: .userInitiated)
     private let ioQueue = DispatchQueue(
         label: "app.andoncord.io", qos: .userInitiated, attributes: .concurrent)
+    /// Where parked connections are watched for their shim hanging up.
+    private let hangupQueue = DispatchQueue(label: "app.andoncord.hangup", qos: .utility)
 
     private let pendingLock = NSLock()
     private var pending: [UUID: PendingDecision] = [:]
@@ -154,6 +160,7 @@ public final class HookServer {
                 if errno == EINTR { continue }
                 return
             }
+            SocketTransport.makeBlocking(clientFD)
 
             // Only talk to our own user. The 0700 run directory is what keeps
             // other users away from the socket; this check holds even if those
@@ -213,6 +220,13 @@ public final class HookServer {
 
         if envelope.blocking {
             let id = UUID()
+            // Once its request line is written, a shim only ever waits. So the
+            // connection turning readable again can only mean it hung up:
+            // Claude Code killed the hook — the turn was interrupted, the
+            // session went away — and nobody is waiting on this answer any
+            // more. Left unwatched, its card would sit on the board answering
+            // nothing until someone clicked it.
+            let hangup = DispatchSource.makeReadSource(fileDescriptor: fd, queue: hangupQueue)
             let decision = PendingDecision(
                 id: id, envelope: envelope,
                 sink: { [weak self] response in
@@ -221,15 +235,32 @@ public final class HookServer {
                     if let response, let data = try? JSONEncoder().encode(response) {
                         try? SocketTransport.writeLine(data, to: fd)
                     }
-                    guard let self else { close(fd); return }
-                    self.closeClient(fd)
+                    // Cancelling is what closes the fd — in the cancel
+                    // handler, so it is never closed under a live source or
+                    // reused while one still watches it.
+                    hangup.cancel()
+                    guard let self else { return }
                     self.pendingLock.lock()
                     self.pending.removeValue(forKey: id)
                     self.pendingLock.unlock()
                 })
+            hangup.setEventHandler { [weak self, weak decision] in
+                var byte: UInt8 = 0
+                let peeked = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+                if peeked < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { return }
+                // EOF, an error, or bytes a real shim never sends: in every
+                // case the conversation is over.
+                guard let decision, !decision.isResolved else { return }
+                decision.abandon()
+                DispatchQueue.main.async { self?.onWithdrawn?(id) }
+            }
+            hangup.setCancelHandler { [weak self] in
+                if let self { self.closeClient(fd) } else { close(fd) }
+            }
             pendingLock.lock()
             pending[id] = decision
             pendingLock.unlock()
+            hangup.resume()
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { decision.abandon(); return }

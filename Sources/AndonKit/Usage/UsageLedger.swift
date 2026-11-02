@@ -32,16 +32,32 @@ public final class UsageLedger {
 
     @ObservationIgnored
     private var cache: [String: IndexEntry] = [:]
+    /// Where the last scan of each live transcript stopped, so the next pass
+    /// reads only what was appended. Memory only: a checkpoint carries the
+    /// scanner's whole running state, which is cheap to keep for the handful
+    /// of sessions in use and pointless for the thousands that are finished.
+    @ObservationIgnored
+    private var checkpoints: [String: TranscriptScanner.Checkpoint] = [:]
     @ObservationIgnored
     private var refreshTask: Task<Void, Never>?
     @ObservationIgnored
     private var ticker: Task<Void, Never>?
+    @ObservationIgnored
+    private var isDirty = false
+    @ObservationIgnored
+    private var lastSavedAt: Date?
 
     /// How often the transcript directory is re-checked. Only files whose
     /// size or mtime moved are re-read, so this is a `stat` per transcript —
     /// cheap enough to keep the board close to live without a watcher on
     /// twenty directories.
     private static let pollInterval: Duration = .seconds(20)
+    /// The index runs to tens of megabytes and any live session changes it on
+    /// every poll. It is entirely derived, so it is written at most this often
+    /// (and on quit): a crash in between costs a re-read of what changed.
+    private static let saveInterval: TimeInterval = 300
+    /// Transcripts touched within this long keep a checkpoint.
+    private nonisolated static let checkpointHorizon: TimeInterval = 2 * 3600
 
     public init() {}
 
@@ -65,6 +81,11 @@ public final class UsageLedger {
         ticker = nil
         refreshTask?.cancel()
         refreshTask = nil
+        // Whatever the save interval held back, so a relaunch starts from it.
+        if isDirty {
+            isDirty = false
+            Self.write(CacheFile(version: Self.cacheVersion, entries: cache))
+        }
     }
 
     /// Re-index anything that changed. Safe to call from a hook event — a
@@ -83,13 +104,19 @@ public final class UsageLedger {
     public func reindexNow() async {
         let known = cache
         if sessions.isEmpty { isIndexing = true }
-        let result = await Self.reindex(known: known)
+        let result = await Self.reindex(known: known, checkpoints: checkpoints)
         cache = result.entries
-        sessions = Self.assemble(result.entries.values)
+        checkpoints = result.checkpoints
+        // Reassigned only when something moved: every view reading the ledger
+        // redraws on assignment, and most polls change nothing.
+        if result.changed || sessions.isEmpty {
+            sessions = Self.assemble(result.entries.values)
+        }
         failure = result.failure
         isIndexing = false
         indexedAt = Date()
-        if result.changed { saveCache() }
+        if result.changed { isDirty = true }
+        await saveCacheIfDue()
         onIndexed?()
     }
 
@@ -285,17 +312,29 @@ public final class UsageLedger {
 
     private struct ReindexResult: Sendable {
         var entries: [String: IndexEntry]
+        var checkpoints: [String: TranscriptScanner.Checkpoint]
         var changed: Bool
         var failure: String?
+    }
+
+    /// A transcript whose size or mtime moved since it was last indexed.
+    private struct StaleTranscript: Sendable {
+        var path: String
+        var url: URL
+        var sessionId: String
+        var isSubagent: Bool
+        var size: Int
+        var modified: Date
     }
 
     /// Walk the transcript tree and re-read only what moved.
     ///
     /// Runs off the main actor: a first index over a year of transcripts is
-    /// hundreds of megabytes of JSON, and doing that on the main thread would
-    /// freeze the notch panel for the duration.
+    /// gigabytes of JSON, and doing that on the main thread would freeze the
+    /// notch panel for the duration.
     private nonisolated static func reindex(
-        known: [String: IndexEntry]
+        known: [String: IndexEntry],
+        checkpoints: [String: TranscriptScanner.Checkpoint]
     ) async -> ReindexResult {
         await Task.detached(priority: .utility) { () -> ReindexResult in
             let root = Paths.claudeDir.appendingPathComponent("projects")
@@ -303,15 +342,14 @@ public final class UsageLedger {
                 at: root, includingPropertiesForKeys: [.isDirectoryKey])
             else {
                 return ReindexResult(
-                    entries: known, changed: false,
+                    entries: known, checkpoints: [:], changed: false,
                     failure: "No transcripts at \(root.path)")
             }
 
+            let horizon = Date().addingTimeInterval(-checkpointHorizon)
             var entries: [String: IndexEntry] = [:]
-            var stale: [(
-                path: String, url: URL, sessionId: String, isSubagent: Bool,
-                size: Int, modified: Date
-            )] = []
+            var kept: [String: TranscriptScanner.Checkpoint] = [:]
+            var stale: [StaleTranscript] = []
 
             for directory in projectDirs {
                 for (file, sessionId, isSubagent) in transcripts(in: directory) {
@@ -323,39 +361,69 @@ public final class UsageLedger {
                     if let cached = known[file.path],
                        cached.size == size, cached.modified == modified {
                         entries[file.path] = cached
+                        if modified > horizon, let checkpoint = checkpoints[file.path] {
+                            kept[file.path] = checkpoint
+                        }
                     } else {
-                        stale.append((file.path, file, sessionId, isSubagent, size, modified))
+                        stale.append(StaleTranscript(
+                            path: file.path, url: file, sessionId: sessionId,
+                            isSubagent: isSubagent, size: size, modified: modified))
                     }
                 }
             }
 
-            // The first index is hundreds of megabytes of JSON and the only
-            // moment this could plausibly feel slow. Files are independent, so
-            // scan them across cores; after that first run this list is
-            // normally one file — whichever session is live.
+            // The first index is gigabytes of JSON and the only moment this
+            // could plausibly feel slow. Files are independent, so they are
+            // scanned in parallel — but on half the cores, not all of them: a
+            // first index that pins every core heats the machine and stalls
+            // whatever the person is actually doing. After that first run this
+            // list is normally a file or two — whichever sessions are live.
             if !stale.isEmpty {
-                let scanned = await withTaskGroup(of: (String, IndexEntry).self) { group in
-                    for item in stale {
-                        group.addTask {
-                            let session = TranscriptScanner.scan(
-                                file: item.url, sessionId: item.sessionId)
-                            return (item.path, IndexEntry(
-                                size: item.size, modified: item.modified, session: session,
-                                isSubagent: item.isSubagent))
+                let width = max(1, ProcessInfo.processInfo.activeProcessorCount / 2)
+                let scanned = await withTaskGroup(
+                    of: (StaleTranscript, IndexEntry, TranscriptScanner.Checkpoint?).self
+                ) { group in
+                    var queue = stale.makeIterator()
+                    for _ in 0..<width {
+                        guard let item = queue.next() else { break }
+                        group.addTask { scan(item, resuming: checkpoints[item.path]) }
+                    }
+                    var results: [(StaleTranscript, IndexEntry, TranscriptScanner.Checkpoint?)] = []
+                    for await result in group {
+                        results.append(result)
+                        if let item = queue.next() {
+                            group.addTask { scan(item, resuming: checkpoints[item.path]) }
                         }
                     }
-                    var results: [String: IndexEntry] = [:]
-                    for await (path, entry) in group { results[path] = entry }
                     return results
                 }
-                entries.merge(scanned) { _, new in new }
+                for (item, entry, checkpoint) in scanned {
+                    entries[item.path] = entry
+                    if item.modified > horizon, let checkpoint { kept[item.path] = checkpoint }
+                }
             }
 
             // A transcript that disappeared drops out by omission, which is
             // still a change worth persisting.
             let changed = !stale.isEmpty || entries.count != known.count
-            return ReindexResult(entries: entries, changed: changed, failure: nil)
+            return ReindexResult(
+                entries: entries, checkpoints: kept, changed: changed, failure: nil)
         }.value
+    }
+
+    /// One transcript, read on from its checkpoint when it has only grown
+    /// since — which is how Claude Code writes them. One that shrank was
+    /// rewritten, and is read again from the top.
+    private nonisolated static func scan(
+        _ item: StaleTranscript, resuming checkpoint: TranscriptScanner.Checkpoint?
+    ) -> (StaleTranscript, IndexEntry, TranscriptScanner.Checkpoint?) {
+        let resumable = checkpoint.flatMap { UInt64(item.size) >= $0.offset ? $0 : nil }
+        let (session, next) = TranscriptScanner.scan(
+            file: item.url, sessionId: item.sessionId, from: resumable)
+        let entry = IndexEntry(
+            size: item.size, modified: item.modified, session: session,
+            isSubagent: item.isSubagent)
+        return (item, entry, next)
     }
 
     // MARK: - Cache
@@ -365,7 +433,7 @@ public final class UsageLedger {
     /// shape changes.
     private static let cacheVersion = 2
 
-    private struct CacheFile: Codable {
+    private struct CacheFile: Codable, Sendable {
         var version: Int
         var entries: [String: IndexEntry]
     }
@@ -379,8 +447,19 @@ public final class UsageLedger {
         sessions = Self.assemble(file.entries.values)
     }
 
-    private func saveCache() {
+    /// Writes the index when it has changed and the last write is old enough.
+    /// Encoding it is tens of megabytes of JSON, so that happens off the main
+    /// actor — on it, the notch stuttered every time a live session moved.
+    private func saveCacheIfDue() async {
+        guard isDirty else { return }
+        if let lastSavedAt, Date().timeIntervalSince(lastSavedAt) < Self.saveInterval { return }
+        isDirty = false
+        lastSavedAt = Date()
         let file = CacheFile(version: Self.cacheVersion, entries: cache)
+        await Task.detached(priority: .utility) { Self.write(file) }.value
+    }
+
+    private nonisolated static func write(_ file: CacheFile) {
         guard let data = try? JSONEncoder().encode(file) else { return }
         try? Paths.ensureDirectories()
         try? data.write(to: Paths.usageIndex, options: .atomic)

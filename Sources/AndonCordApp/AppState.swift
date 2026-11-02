@@ -56,8 +56,13 @@ final class AppState {
     /// moment it is needed.
     private(set) var calibration = QuotaCalibration.load()
 
+    /// Re-registers the global shortcuts after the setting changes. Wired by
+    /// the app delegate, which owns both halves they connect.
+    @ObservationIgnored
+    var applyShortcuts: (() -> Void)?
+
     init() {
-        board.onSound = { [weak self] sound in self?.playSound(sound) }
+        board.onSound = { [weak self] sound, session in self?.playSound(sound, for: session) }
         board.onQuotaSample = { [weak self] snapshot in self?.calibrate(against: snapshot) }
         anthropicUsage.onReading = { [weak self] limits, at in
             self?.calibrate(limits: limits, capturedAt: at)
@@ -312,6 +317,7 @@ final class AppState {
             // the board instead of trailing the poll interval.
             if envelope.payload.event == .stop { self.ledger.refresh() }
         }
+        server.onWithdrawn = { [weak self] id in self?.board.withdraw(decisionId: id) }
 
         do {
             try server.start()
@@ -333,6 +339,16 @@ final class AppState {
         // Sessions whose process died without a SessionEnd would otherwise sit
         // on the board reading "running" indefinitely.
         board.startReapingDeadSessions()
+        // An update that changes which hooks the app needs brings them up to
+        // date itself. The person agreed to these entries when they installed
+        // them; a new version of the same app is not a new question.
+        if installer.hooksNeedUpgrade {
+            do {
+                try installer.upgradeHooks()
+            } catch {
+                AndonLog.ui.error("Hook upgrade failed: \(error.localizedDescription)")
+            }
+        }
         refreshInstallStatus()
 
         // The launcher embeds the current bundle path. Rewriting it on every
@@ -398,11 +414,24 @@ final class AppState {
 
     // MARK: - Sound
 
-    private func playSound(_ sound: BoardSound) {
+    private func playSound(_ sound: BoardSound, for session: Session) {
         guard settings.soundsEnabled else { return }
         if settings.quietWhileFocused && Self.isDoNotDisturbLikely { return }
+        // The person is already looking at this session's own prompt.
+        if settings.quietWhenSessionInFront && isAppInFront(for: session) { return }
         chiptune.volume = Float(settings.volume)
         chiptune.play(sound)
+    }
+
+    /// Whether the app a session runs in — its terminal, or the Claude app —
+    /// is the frontmost one. Bundle ids only, so it is cheap and needs no
+    /// permission; which tab is showing is not something to ask a terminal
+    /// on every chime.
+    func isAppInFront(for session: Session) -> Bool {
+        guard let host = session.terminal?.activationBundleIdentifier?.lowercased(),
+              let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.lowercased()
+        else { return false }
+        return host == front
     }
 
     func previewSound(_ sound: BoardSound) {

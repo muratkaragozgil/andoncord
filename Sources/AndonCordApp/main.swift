@@ -12,11 +12,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state = AppState()
     private let notch = NotchController()
     private var menuBar: MenuBarController?
+    private var shortcuts: BoardShortcuts?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         state.start()
 
         notch.attach(to: state)
+
+        let shortcuts = BoardShortcuts(app: state, notch: notch)
+        state.applyShortcuts = { [weak shortcuts] in shortcuts?.apply() }
+        shortcuts.apply()
+        self.shortcuts = shortcuts
 
         let menuBar = MenuBarController(app: state, controller: notch)
         menuBar.install()
@@ -49,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        shortcuts?.unregisterAll()
         state.stop()
     }
 

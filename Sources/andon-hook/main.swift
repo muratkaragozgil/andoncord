@@ -108,7 +108,7 @@ if invocation.isStatusline {
     // Chain to the previous statusline command, passing the identical payload.
     if let chainData = try? Data(contentsOf: Paths.statuslineChain),
        let chain = try? JSONDecoder().decode(StatuslineChain.self, from: chainData),
-       let command = chain.command, !command.isEmpty {
+       let command = chain.forwardCommand {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]
@@ -148,7 +148,9 @@ let payload = (try? JSONDecoder().decode(HookPayload.self, from: stdinData)) ?? 
 let terminal = TerminalContext.capture(
     environment: ProcessInfo.processInfo.environment,
     ttyPath: currentTTYPath(),
-    parentPid: getppid()
+    parentPid: getppid(),
+    // Two `sysctl` calls at most: the wrapper shell, then Claude Code.
+    hostPid: TerminalContext.hostProcess(ofParent: getppid())
 )
 
 let envelope = HookEnvelope(

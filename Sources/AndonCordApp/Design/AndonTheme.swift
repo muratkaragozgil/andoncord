@@ -187,60 +187,138 @@ struct AndonLamp: View {
 /// screen is the cost, and it is paid per frame no matter how little of it
 /// changed. Only not animating avoids it.
 ///
-/// So the lever that is left is frame rate, and it is sublinear: 30fps
-/// measures 14.2% and 15fps measures 11.6%. `frameRate` below takes the first
-/// of those. The bars still move continuously — they are still a sine of the
-/// real clock, not a two-state pulse — they are just sampled at a rate a
-/// three-bar equalizer eight points tall cannot tell from the display's own.
-/// 15fps was left on the table deliberately: another 2.6 points is not worth
-/// motion you can see stepping.
+/// Frame rate was the lever that left: sublinear, 30fps measuring 14.2% and
+/// 15fps 11.6%. Measured on a live board, the 30fps Canvas still ran 11% of a
+/// core for as long as any session worked — which, with a few sessions open,
+/// is all day.
+///
+/// The way out of "only not animating avoids it" turned out to be not
+/// animating *in this process*. The bars are now three Core Animation layers
+/// whose heights are keyframed once, as one period of the same sine; the
+/// render server loops it. The app commits nothing per frame, so SwiftUI
+/// re-evaluates nothing and redraws nothing. The motion is unchanged — the
+/// same wave, the same phases, still keyed to the real clock so every lamp on
+/// the board moves in step — and it is smoother for it, since the render
+/// server plays it at the display's own rate.
 struct WorkingIndicator: View {
     let color: Color
     var size: CGFloat = 8
 
-    /// Even a redraw is worth skipping when nobody can see it: the panel is
-    /// laid out while collapsed, so its lamps would otherwise animate behind a
-    /// fully transparent container. Heights come from absolute time, so
-    /// resuming lands wherever the wave is by then — a discontinuity that
-    /// happens while the bars are invisible.
+    /// Nothing animates while nobody can see it: the panel is laid out while
+    /// collapsed, so its lamps would otherwise run behind a fully transparent
+    /// container. Heights come from absolute time, so resuming lands wherever
+    /// the wave is by then — a discontinuity that happens while the bars are
+    /// invisible.
     @Environment(\.andonIsVisible) private var isVisible
 
-    private let barCount = 3
+    var body: some View {
+        EqualizerBars(color: NSColor(color), size: size, isAnimating: isVisible)
+            .frame(width: size, height: size)
+    }
+}
+
+/// The working lamp's bars, as layers the render server animates.
+private struct EqualizerBars: NSViewRepresentable {
+    let color: NSColor
+    let size: CGFloat
+    let isAnimating: Bool
+
+    func makeNSView(context: Context) -> EqualizerView { EqualizerView() }
+
+    func updateNSView(_ view: EqualizerView, context: Context) {
+        view.update(color: color, size: size, isAnimating: isAnimating)
+    }
+}
+
+final class EqualizerView: NSView {
+    private let bars = [CALayer(), CALayer(), CALayer()]
     /// Each bar is offset in the wave so they never move in unison, which is
     /// what separates "activity" from "a blinking group".
-    private let phases: [Double] = [0, 1.1, 2.2]
+    private static let phases: [Double] = [0, 1.1, 2.2]
+    /// Radians per second: the bars complete a cycle every 2π/7 ≈ 0.9 s.
+    private static let angularSpeed = 7.0
+    private static let animationKey = "equalizer"
 
-    /// Deliberately below the display's rate — see the measurements above.
-    private static let frameRate: Double = 30
+    private var color: NSColor?
+    private var size: CGFloat = 0
+    private var isAnimating = false
 
-    var body: some View {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        for bar in bars { layer?.addSublayer(bar) }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not used from a nib") }
+
+    override var isFlipped: Bool { true }
+
+    func update(color: NSColor, size: CGFloat, isAnimating: Bool) {
+        let geometryChanged = size != self.size || color != self.color
+        if geometryChanged {
+            self.color = color
+            self.size = size
+            layOut()
+        }
+        if geometryChanged || isAnimating != self.isAnimating {
+            self.isAnimating = isAnimating
+            if isAnimating { animate() } else { bars.forEach { $0.removeAnimation(forKey: Self.animationKey) } }
+        }
+    }
+
+    private func height(at angle: Double) -> CGFloat {
+        size * (0.32 + 0.68 * (0.5 + 0.5 * sin(angle)))
+    }
+
+    private func layOut() {
+        guard let color else { return }
         let barWidth = size * 0.22
         let spacing = size * 0.17
-
-        TimelineView(.animation(minimumInterval: 1 / Self.frameRate, paused: !isVisible)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            Canvas { context, canvasSize in
-                let span = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * spacing
-                var x = (canvasSize.width - span) / 2
-                for index in 0..<barCount {
-                    let wave = 0.5 + 0.5 * sin(t * 7 + phases[index])
-                    let height = size * (0.32 + 0.68 * wave)
-                    let bar = CGRect(
-                        x: x, y: (canvasSize.height - height) / 2,
-                        width: barWidth, height: height)
-                    context.fill(
-                        Path(roundedRect: bar, cornerRadius: barWidth / 2, style: .continuous),
-                        with: .color(color))
-                    x += barWidth + spacing
-                }
-            }
+        let span = 3 * barWidth + 2 * spacing
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, bar) in bars.enumerated() {
+            bar.bounds = CGRect(x: 0, y: 0, width: barWidth, height: height(at: Self.phases[index]))
+            bar.position = CGPoint(
+                x: (size - span) / 2 + CGFloat(index) * (barWidth + spacing) + barWidth / 2,
+                y: size / 2)
+            bar.cornerRadius = barWidth / 2
+            bar.cornerCurve = .continuous
+            bar.backgroundColor = color.cgColor
+            // On the bars rather than the view: a SwiftUI shadow over an
+            // AppKit view would have to be recomputed from outside, every frame.
+            bar.shadowColor = color.cgColor
+            bar.shadowOpacity = 0.5
+            bar.shadowRadius = 2
+            bar.shadowOffset = .zero
         }
-        .frame(width: size, height: size)
-        // Outside the canvas, not a `Canvas` filter: a filter is clipped to the
-        // canvas rect, and at full extension a bar fills it — the glow would be
-        // cut off exactly when it should be brightest. Out here it bleeds past
-        // the frame the way it always did, and it is still only a render pass.
-        .shadow(color: color.opacity(0.5), radius: 2)
+        CATransaction.commit()
+    }
+
+    /// One period of the wave per bar, looped forever by the render server.
+    private func animate() {
+        let period = 2 * Double.pi / Self.angularSpeed
+        let samples = 36
+        let now = Date().timeIntervalSinceReferenceDate
+        for (index, bar) in bars.enumerated() {
+            let animation = CAKeyframeAnimation(keyPath: "bounds.size.height")
+            animation.values = (0...samples).map { step in
+                height(at: 2 * Double.pi * Double(step) / Double(samples))
+            }
+            animation.keyTimes = (0...samples).map { NSNumber(value: Double($0) / Double(samples)) }
+            animation.calculationMode = .linear
+            animation.duration = period
+            animation.repeatCount = .infinity
+            animation.isRemovedOnCompletion = false
+            // Start where the wave is right now on the real clock, so lamps
+            // added at different moments still move in step.
+            let angle = (now * Self.angularSpeed + Self.phases[index])
+                .truncatingRemainder(dividingBy: 2 * Double.pi)
+            animation.timeOffset = angle / Self.angularSpeed
+            bar.add(animation, forKey: Self.animationKey)
+        }
     }
 }
 

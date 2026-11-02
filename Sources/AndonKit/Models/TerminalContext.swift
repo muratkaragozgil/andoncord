@@ -64,9 +64,10 @@ public enum TerminalKind: String, Codable, Sendable, CaseIterable {
     /// Whether we can land on the exact tab/pane, or only raise the app.
     public var supportsPreciseJump: Bool {
         switch self {
-        case .iTerm2, .appleTerminal, .ghostty, .wezTerm, .kitty, .warp:
+        case .iTerm2, .appleTerminal, .ghostty, .wezTerm, .kitty:
             return true
-        case .alacritty, .hyper, .zed, .vscode, .cursor, .windsurf,
+        // Warp addresses no tab from outside; the row says "Click to raise".
+        case .warp, .alacritty, .hyper, .zed, .vscode, .cursor, .windsurf,
              .claudeDesktop, .unknown:
             return false
         }
@@ -102,7 +103,15 @@ public struct TerminalContext: Codable, Sendable, Hashable {
     public var tmuxPane: String?
 
     public var isVSCodeTerminal: Bool
+    /// The shim's immediate parent. With the installed hook command that is
+    /// the `/bin/sh -c '…; exit 0'` wrapper, which exits with the hook — so
+    /// it says nothing about whether the session is alive. Kept for what an
+    /// older shim sends; `hostPid` is the one to trust.
     public var shimParentPid: Int32?
+    /// The Claude Code process the hook ran for: the shim's nearest ancestor
+    /// that is not a shell. It lives exactly as long as the session does,
+    /// which makes it the liveness check the reaper needs.
+    public var hostPid: Int32?
     /// `__CFBundleIdentifier` of whatever launched the shell.
     ///
     /// The fallback that makes a jump possible at all when no terminal is
@@ -126,6 +135,7 @@ public struct TerminalContext: Codable, Sendable, Hashable {
         tmuxPane: String? = nil,
         isVSCodeTerminal: Bool = false,
         shimParentPid: Int32? = nil,
+        hostPid: Int32? = nil,
         hostBundleIdentifier: String? = nil
     ) {
         self.kind = kind
@@ -143,6 +153,7 @@ public struct TerminalContext: Codable, Sendable, Hashable {
         self.tmuxPane = tmuxPane
         self.isVSCodeTerminal = isVSCodeTerminal
         self.shimParentPid = shimParentPid
+        self.hostPid = hostPid
         self.hostBundleIdentifier = hostBundleIdentifier
     }
 
@@ -164,7 +175,8 @@ public struct TerminalContext: Codable, Sendable, Hashable {
     public static func capture(
         environment: [String: String],
         ttyPath: String?,
-        parentPid: Int32?
+        parentPid: Int32?,
+        hostPid: Int32? = nil
     ) -> TerminalContext {
         let termProgram = environment["TERM_PROGRAM"]
         let kind = detectKind(environment: environment, termProgram: termProgram)
@@ -186,8 +198,52 @@ public struct TerminalContext: Codable, Sendable, Hashable {
             isVSCodeTerminal: environment["VSCODE_INJECTION"] != nil
                 || termProgram == "vscode",
             shimParentPid: parentPid,
+            hostPid: hostPid,
             hostBundleIdentifier: environment["__CFBundleIdentifier"]
         )
+    }
+
+    // MARK: - The process behind the hook
+
+    /// Programs that sit between Claude Code and the shim without being
+    /// either: the shell Claude Code runs a hook command through, the one
+    /// our fail-open wrapper starts, and anything the user's own setup puts
+    /// in between.
+    static let intermediaries: Set<String> = [
+        "sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "env", "nu",
+    ]
+
+    /// Walk up from `pid` to the first ancestor that is not a shell. `entry`
+    /// returns a process's command name and parent; injectable so the walk is
+    /// testable without building a process tree.
+    static func nearestNonShellAncestor(
+        from pid: Int32, maxHops: Int = 8,
+        entry: (Int32) -> (name: String, parent: Int32)?
+    ) -> Int32? {
+        var current = pid
+        for _ in 0..<maxHops {
+            guard current > 1, let process = entry(current) else { return nil }
+            if !intermediaries.contains(process.name) { return current }
+            current = process.parent
+        }
+        return nil
+    }
+
+    /// The Claude Code process a hook is running for, seen from the shim.
+    public static func hostProcess(ofParent parent: Int32) -> Int32? {
+        nearestNonShellAncestor(from: parent, entry: processEntry)
+    }
+
+    /// Command name and parent pid, from the kernel's process table.
+    static func processEntry(_ pid: Int32) -> (name: String, parent: Int32)? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let name = withUnsafeBytes(of: info.kp_proc.p_comm) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return (name, info.kp_eproc.e_ppid)
     }
 
     private static func detectKind(

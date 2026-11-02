@@ -79,12 +79,177 @@ public enum TerminalJumper {
     ///
     /// Runs entirely off the main thread; the caller's task suspends rather
     /// than blocks.
+    /// - Parameter workingDirectory: the session's directory. Ghostty
+    ///   terminals have no tty, so it is how one is found.
     @discardableResult
-    public static func jump(to context: TerminalContext) async -> JumpResult {
+    public static func jump(
+        to context: TerminalContext, workingDirectory: String? = nil
+    ) async -> JumpResult {
         await withCheckedContinuation { continuation in
             queue.async {
-                continuation.resume(returning: performJump(context))
+                continuation.resume(returning: performJump(context, workingDirectory: workingDirectory))
             }
+        }
+    }
+
+    // MARK: - Replying
+
+    /// Whether `send(_:to:workingDirectory:)` can reach this session: a tmux
+    /// pane, an iTerm2 session, or a Ghostty terminal.
+    public static func canSendText(to context: TerminalContext) -> Bool {
+        if context.isInsideTmux, context.tmuxPane.map(isPlausibleIdentifier) == true { return true }
+        switch context.kind {
+        case .iTerm2: return context.ttyPath?.isEmpty == false
+        case .ghostty: return true
+        default: return false
+        }
+    }
+
+    /// Type a reply into the session's terminal and press Return — what the
+    /// person would have done had they gone there.
+    ///
+    /// The text goes in literally and Return separately: a newline carried
+    /// inside the text arrives as a line feed, which Claude Code's prompt
+    /// takes for "new line", not "send".
+    public static func send(
+        _ text: String, to context: TerminalContext, workingDirectory: String?
+    ) async -> JumpResult {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: performSend(
+                    text, to: context, workingDirectory: workingDirectory))
+            }
+        }
+    }
+
+    private static func performSend(
+        _ text: String, to context: TerminalContext, workingDirectory: String?
+    ) -> JumpResult {
+        let line = text.replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        guard !line.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return .failed("nothing to send")
+        }
+
+        if context.isInsideTmux, let pane = context.tmuxPane, isPlausibleIdentifier(pane) {
+            guard let socket = tmuxSocketPath(from: context.tmuxSocket),
+                  let tmux = locateExecutable(named: "tmux", candidates: tmuxCandidates)
+            else { return .failed("tmux is not reachable") }
+            let typed = runCommand(
+                executable: tmux, arguments: ["-S", socket, "send-keys", "-t", pane, "-l", "--", line])
+            guard typed.succeeded else { return .failed("tmux send-keys failed: \(typed.failureSummary)") }
+            let entered = runCommand(
+                executable: tmux, arguments: ["-S", socket, "send-keys", "-t", pane, "Enter"])
+            return entered.succeeded ? .precise : .failed("tmux send-keys failed: \(entered.failureSummary)")
+        }
+
+        switch context.kind {
+        case .iTerm2:
+            guard let tty = context.ttyPath, !tty.isEmpty else { return .failed("no tty recorded") }
+            guard isRunning(.iTerm2) else { return .failed("iTerm2 is not running") }
+            let script = """
+            tell application id \(quoted(TerminalKind.iTerm2.bundleIdentifier ?? ""))
+                repeat with theWindow in windows
+                    repeat with theTab in tabs of theWindow
+                        repeat with theSession in sessions of theTab
+                            if tty of theSession is \(quoted(tty)) then
+                                tell theSession
+                                    write text \(quoted(line)) newline NO
+                                    write text (ASCII character 13) newline NO
+                                end tell
+                                return "matched"
+                            end if
+                        end repeat
+                    end repeat
+                end repeat
+            end tell
+            return "unmatched"
+            """
+            return replyOutcome(runAppleScript(script), kind: .iTerm2)
+
+        case .ghostty:
+            guard let workingDirectory, !workingDirectory.isEmpty else {
+                return .failed("no working directory to find the Ghostty terminal by")
+            }
+            guard isRunning(.ghostty) else { return .failed("Ghostty is not running") }
+            let script = ghosttyScript(
+                matching: workingDirectory,
+                then: """
+                input text \(quoted(line)) to theTerminal
+                send key "enter" to theTerminal
+                """)
+            return replyOutcome(runAppleScript(script), kind: .ghostty)
+
+        default:
+            return .failed("\(context.kind.displayName) cannot be typed into from here")
+        }
+    }
+
+    private static func replyOutcome(_ outcome: AppleScriptOutcome, kind: TerminalKind) -> JumpResult {
+        switch outcome {
+        case .matched: return .precise
+        case .unmatched: return .failed("the session's \(kind.displayName) tab is gone")
+        case .permissionDenied:
+            return .failed("allow AndonCord to control \(kind.displayName) in System Settings → Privacy & Security → Automation")
+        case .failure(let reason): return .failed(reason)
+        }
+    }
+
+    // MARK: - Ghostty
+
+    /// Ghostty 1.3 and later script their windows, tabs and terminals. A
+    /// terminal exposes no tty, so the working directory is the handle; the
+    /// first terminal in it wins. `body` runs with `theWindow`, `theTab` and
+    /// `theTerminal` bound.
+    private static func ghosttyScript(matching directory: String, then body: String) -> String {
+        let candidates = [directory, directory.hasSuffix("/") ? String(directory.dropLast()) : directory + "/"]
+        let test = candidates.map { "(working directory of theTerminal as text) is \(quoted($0))" }
+            .joined(separator: " or ")
+        return """
+        tell application id \(quoted(TerminalKind.ghostty.bundleIdentifier ?? ""))
+            repeat with theWindow in windows
+                repeat with theTab in tabs of theWindow
+                    repeat with theTerminal in terminals of theTab
+                        if \(test) then
+                            \(body)
+                            return "matched"
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+        return "unmatched"
+        """
+    }
+
+    /// Window, then tab, then the split itself — Ghostty applies each
+    /// asynchronously, hence the short pauses. `activate` comes last on
+    /// purpose: activating Ghostty with no window focused opens its quick
+    /// terminal instead.
+    private static func jumpToGhostty(_ context: TerminalContext, workingDirectory: String?) -> JumpResult {
+        guard isRunning(.ghostty) else { return .failed("Ghostty is not running") }
+        guard let workingDirectory, !workingDirectory.isEmpty else {
+            return .failed("no working directory to find the Ghostty terminal by")
+        }
+        let script = ghosttyScript(
+            matching: workingDirectory,
+            then: """
+            activate window theWindow
+            delay 0.05
+            select tab theTab
+            delay 0.05
+            focus theTerminal
+            activate
+            """)
+        switch runAppleScript(script) {
+        case .matched:
+            return .precise
+        case .unmatched:
+            return .failed("no Ghostty terminal is in \(workingDirectory)")
+        case .permissionDenied:
+            return .failed("allow AndonCord to control Ghostty in System Settings → Privacy & Security → Automation")
+        case .failure(let reason):
+            return .failed(reason)
         }
     }
 
@@ -98,7 +263,7 @@ public enum TerminalJumper {
         completion: (@Sendable (JumpResult) -> Void)? = nil
     ) {
         queue.async {
-            let result = performJump(context)
+            let result = performJump(context, workingDirectory: nil)
             guard let completion else { return }
             DispatchQueue.main.async { completion(result) }
         }
@@ -152,8 +317,10 @@ public enum TerminalJumper {
 
     // MARK: - Dispatch
 
-    private static func performJump(_ context: TerminalContext) -> JumpResult {
-        let result = route(context)
+    private static func performJump(
+        _ context: TerminalContext, workingDirectory: String?
+    ) -> JumpResult {
+        let result = route(context, workingDirectory: workingDirectory)
         switch result {
         case .precise:
             Log.jump.info(
@@ -174,7 +341,7 @@ public enum TerminalJumper {
         return result
     }
 
-    private static func route(_ context: TerminalContext) -> JumpResult {
+    private static func route(_ context: TerminalContext, workingDirectory: String?) -> JumpResult {
         // tmux wins over the host terminal: when a session lives in a tmux
         // pane, the terminal's own tab addressing points at the tmux client,
         // not at the pane the session is actually in.
@@ -194,7 +361,14 @@ public enum TerminalJumper {
             return jumpToWezTerm(context)
         case .kitty:
             return jumpToKitty(context)
-        case .ghostty, .warp, .alacritty, .hyper, .zed, .vscode, .cursor,
+        case .ghostty:
+            let precise = jumpToGhostty(context, workingDirectory: workingDirectory)
+            if case .failed(let reason) = precise {
+                Log.jump.notice("Ghostty jump fell back to the app: \(reason, privacy: .public)")
+                return activateGhosttyWindow()
+            }
+            return precise
+        case .warp, .alacritty, .hyper, .zed, .vscode, .cursor,
              .windsurf, .claudeDesktop, .unknown:
             // None of these expose a public, stable way to address an
             // individual tab or split from outside the app. Raising the app is
@@ -470,6 +644,27 @@ public enum TerminalJumper {
         return .appActivated
     }
 
+    /// Raise Ghostty's front window. Not `NSRunningApplication.activate()`,
+    /// which with no window focused opens Ghostty's quick terminal instead.
+    private static func activateGhosttyWindow() -> JumpResult {
+        guard isRunning(.ghostty) else { return .failed("Ghostty is not running") }
+        let script = """
+        tell application id \(quoted(TerminalKind.ghostty.bundleIdentifier ?? ""))
+            if (count of windows) is 0 then return "unmatched"
+            activate window (item 1 of windows)
+            activate
+        end tell
+        return "matched"
+        """
+        switch runAppleScript(script) {
+        case .matched: return .appActivated
+        case .unmatched: return .failed("Ghostty has no window open")
+        case .permissionDenied:
+            return .failed("allow AndonCord to control Ghostty in System Settings → Privacy & Security → Automation")
+        case .failure(let reason): return .failed(reason)
+        }
+    }
+
     private static func isRunning(_ kind: TerminalKind) -> Bool {
         guard let bundleID = kind.bundleIdentifier else { return false }
         return !NSRunningApplication.runningApplications(
@@ -479,9 +674,9 @@ public enum TerminalJumper {
 
     private static func usesAppleEvents(_ kind: TerminalKind) -> Bool {
         switch kind {
-        case .iTerm2, .appleTerminal:
+        case .iTerm2, .appleTerminal, .ghostty:
             return true
-        case .ghostty, .warp, .wezTerm, .kitty, .alacritty, .hyper, .zed,
+        case .warp, .wezTerm, .kitty, .alacritty, .hyper, .zed,
              .vscode, .cursor, .windsurf, .claudeDesktop, .unknown:
             return false
         }

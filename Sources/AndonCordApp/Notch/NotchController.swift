@@ -62,6 +62,19 @@ final class NotchController {
     @ObservationIgnored private var geometry: NotchGeometry?
     @ObservationIgnored private var screenObserver: NSObjectProtocol?
     @ObservationIgnored private var pendingCollapse: Task<Void, Never>?
+    @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
+
+    /// A fullscreen app covers the board's display.
+    @ObservationIgnored private var isOverFullscreen = false
+    /// A shortcut asked for the board while a fullscreen app was hiding it.
+    /// Holds until the board is put away again.
+    @ObservationIgnored private var revealedOverFullscreen = false
+    /// Opened by a shortcut press rather than a click, so it closes again
+    /// once the shortcut has done what it came for.
+    @ObservationIgnored private var openedByShortcut = false
+    /// Leaving fullscreen does not always announce itself, so while the
+    /// board is hidden for it, it looks again every second and a half.
+    @ObservationIgnored private var fullscreenPoller: Timer?
 
     /// Grace period before collapsing after the pointer leaves.
     ///
@@ -82,7 +95,23 @@ final class NotchController {
             MainActor.assumeIsolated { self?.rebuildGeometry() }
         }
 
+        // A Space change is how entering or leaving fullscreen shows up; an
+        // app activation can also change whose session is in front.
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.activeSpaceDidChangeNotification,
+                     NSWorkspace.didActivateApplicationNotification] {
+            workspaceObservers.append(workspace.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.refreshFullscreen()
+                    self?.updatePresentation()
+                }
+            })
+        }
+
         observeBoard()
+        refreshFullscreen()
         updatePresentation()
     }
 
@@ -90,6 +119,7 @@ final class NotchController {
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
         }
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
     }
 
     /// Re-run whenever the observable board changes.
@@ -116,8 +146,18 @@ final class NotchController {
 
     // MARK: - Presentation
 
-    func toggleExpanded() {
+    /// `revealing`: a shortcut asked, so a fullscreen app does not keep the
+    /// board hidden.
+    func toggleExpanded(revealing: Bool = false) {
+        if revealing, isOverFullscreen, !revealedOverFullscreen {
+            reveal()
+            return
+        }
         isPinnedOpen.toggle()
+        if !isPinnedOpen {
+            revealedOverFullscreen = false
+            openedByShortcut = false
+        }
         pendingCollapse?.cancel()
         pendingCollapse = nil
         updatePresentation()
@@ -125,7 +165,74 @@ final class NotchController {
 
     func collapse() {
         isPinnedOpen = false
+        revealedOverFullscreen = false
+        openedByShortcut = false
         updatePresentation()
+    }
+
+    /// Bring the board up for a shortcut, over a fullscreen app if need be.
+    func reveal() {
+        revealedOverFullscreen = isOverFullscreen
+        if !isPinnedOpen { openedByShortcut = true }
+        isPinnedOpen = true
+        pendingCollapse?.cancel()
+        pendingCollapse = nil
+        updatePresentation()
+    }
+
+    /// A shortcut settled the card. If a shortcut is also what opened the
+    /// board, it goes away again — the person never reached for the mouse,
+    /// and should not have to now.
+    func shortcutActed() {
+        guard openedByShortcut else { return }
+        collapse()
+    }
+
+    /// Whether the request card is on screen to be acted on.
+    var isShowingCard: Bool {
+        presentation == .expanded && app?.board.sessionsNeedingHuman.first?.pending != nil
+    }
+
+    // MARK: - Fullscreen
+
+    private func refreshFullscreen() {
+        let covered = (app?.settings.hideInFullscreen ?? false) && frontAppFillsBoardScreen()
+        if covered != isOverFullscreen {
+            isOverFullscreen = covered
+            if !covered { revealedOverFullscreen = false }
+        }
+        if covered, fullscreenPoller == nil {
+            fullscreenPoller = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.refreshFullscreen()
+                    self?.updatePresentation()
+                }
+            }
+        } else if !covered {
+            fullscreenPoller?.invalidate()
+            fullscreenPoller = nil
+        }
+    }
+
+    /// Window bounds and owners need no Screen Recording permission; only
+    /// titles do, and they are not read.
+    private func frontAppFillsBoardScreen() -> Bool {
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              front.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              let screen = (geometry ?? currentGeometry())?.screen,
+              let primaryMaxY = NSScreen.screens.first?.frame.maxY,
+              let windows = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        let bounds = windows.compactMap { window -> CGRect? in
+            guard window[kCGWindowOwnerPID as String] as? pid_t == front.processIdentifier,
+                  window[kCGWindowLayer as String] as? Int == 0,
+                  let dictionary = window[kCGWindowBounds as String] as? NSDictionary
+            else { return nil }
+            return CGRect(dictionaryRepresentation: dictionary)
+        }
+        return ScreenCover.isCovered(
+            screen: screen.frame, byWindows: bounds, primaryScreenMaxY: primaryMaxY)
     }
 
     private func scheduleCollapse() {
@@ -141,13 +248,21 @@ final class NotchController {
     private func updatePresentation() {
         guard let app else { return }
         let board = app.board
-        let needsHuman = !board.sessionsNeedingHuman.isEmpty
+        let waiting = board.sessionsNeedingHuman
+        let needsHuman = !waiting.isEmpty
+        // Every waiting session's own app is in front, so the same prompt is
+        // already on screen there; popping open on top of it is noise. The
+        // pill still blinks.
+        let promptAlreadyInView = app.settings.quietWhenSessionInFront && needsHuman
+            && waiting.allSatisfy { app.isAppInFront(for: $0) }
 
         let next: Presentation
-        if board.sessions.isEmpty && app.settings.hideWhenIdle && !isPinnedOpen {
+        if isOverFullscreen && !revealedOverFullscreen {
+            next = .hidden
+        } else if board.sessions.isEmpty && app.settings.hideWhenIdle && !isPinnedOpen {
             next = .hidden
         } else if isPinnedOpen || isHovering
-                    || (needsHuman && app.settings.autoExpandOnCord) {
+                    || (needsHuman && app.settings.autoExpandOnCord && !promptAlreadyInView) {
             next = .expanded
         } else {
             next = .pill
@@ -172,9 +287,12 @@ final class NotchController {
             panel?.acceptsKey = false
             showPanel()
         case .expanded:
-            // Only accept keystrokes while a decision is on screen, so
-            // ⌘Y/⌘N never swallow a keypress meant for the editor.
-            panel?.acceptsKey = !(app?.board.sessionsNeedingHuman.isEmpty ?? true)
+            // Able to take keystrokes while open — the card's answer box and
+            // a reply both need them. A non-activating panel only becomes key
+            // when clicked into, so this never takes a keypress meant for the
+            // app in front; the system-wide shortcuts are what work without
+            // a click.
+            panel?.acceptsKey = true
             showPanel()
         }
         syncInteractiveRegion()

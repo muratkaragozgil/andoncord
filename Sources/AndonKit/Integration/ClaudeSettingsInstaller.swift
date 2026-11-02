@@ -85,24 +85,27 @@ public struct ClaudeSettingsInstaller {
             // Gives us the session title before Claude has generated one.
             HookEventName.userPromptSubmit.rawValue: [["hooks": [passive]]],
 
-            // Activity stream.
-            HookEventName.preToolUse.rawValue: [
-                ["matcher": "*", "hooks": [passive]],
-                // The two tools the notch can answer better than the terminal.
-                // A separate group so the common path stays non-blocking.
-                [
-                    "matcher": InterceptedTool.matcherPattern,
-                    "hooks": [blocking],
-                ],
-            ],
+            // Activity stream. Never blocking: a `PreToolUse` hook that waits
+            // holds back Claude Code's own dialog until it returns, which
+            // would leave a person at the terminal unable to answer there.
+            HookEventName.preToolUse.rawValue: [["matcher": "*", "hooks": [passive]]],
             HookEventName.postToolUse.rawValue: [["matcher": "*", "hooks": [passive]]],
             HookEventName.postToolUseFailure.rawValue: [["matcher": "*", "hooks": [passive]]],
+            // Auto mode turning a call down. Rare, and otherwise invisible.
+            HookEventName.permissionDenied.rawValue: [["matcher": "*", "hooks": [passive]]],
 
-            // The cord itself.
+            // The cord itself — permissions, questions and plans alike. Claude
+            // Code shows its own dialog while this runs, and whichever answer
+            // comes first wins, so the terminal keeps working as it always did.
             HookEventName.permissionRequest.rawValue: [
                 ["matcher": "*", "hooks": [blocking]],
             ],
             HookEventName.notification.rawValue: [["matcher": "*", "hooks": [passive]]],
+            // MCP servers asking for input. Passive on purpose: Claude Code
+            // waits for these hooks before showing its own form, so the
+            // board describes the request and never holds it.
+            HookEventName.elicitation.rawValue: [["hooks": [passive]]],
+            HookEventName.elicitationResult.rawValue: [["hooks": [passive]]],
 
             // Turn boundaries.
             HookEventName.stop.rawValue: [["hooks": [passive]]],
@@ -146,9 +149,17 @@ public struct ClaudeSettingsInstaller {
             }
         }
 
+        // Events an earlier version registered and this one no longer does.
+        for (event, groups) in hooks where desiredGroups()[event] == nil {
+            if let groups = groups as? [[String: Any]], groups.contains(where: groupCarriesMarker) {
+                foundMarker = true
+                missingEvents.append(event)
+            }
+        }
+
         guard foundMarker else { return .notInstalled }
         if !missingEvents.isEmpty {
-            return .drifted(reason: "hooks out of date: \(missingEvents.sorted().joined(separator: ", "))")
+            return .drifted(reason: "\(Self.outdatedHooksPrefix)\(missingEvents.sorted().joined(separator: ", "))")
         }
 
         let statusline = settings["statusLine"] as? [String: Any]
@@ -157,6 +168,52 @@ public struct ClaudeSettingsInstaller {
             return .drifted(reason: "statusline not installed")
         }
         return .installed
+    }
+
+    static let outdatedHooksPrefix = "hooks out of date: "
+
+    /// Whether our hooks are present but were written by a different version,
+    /// and can be brought up to date without losing anything.
+    ///
+    /// That is the one drift worth fixing without asking: the person already
+    /// agreed to these entries, and an app update changing what it needs is
+    /// not a new decision. Anything else — the statusline taken back, the
+    /// file unreadable, comments a rewrite would drop — is left for them to
+    /// repair.
+    public var hooksNeedUpgrade: Bool {
+        guard case .drifted(let reason) = currentStatus(),
+              reason.hasPrefix(Self.outdatedHooksPrefix)
+        else { return false }
+        return (try? readSettings().hadComments) == false
+    }
+
+    /// Rewrite our hook entries to this version's set, leaving everything
+    /// else — other tools' hooks, the statusline — exactly as it is.
+    @discardableResult
+    public func upgradeHooks() throws -> URL? {
+        try Paths.ensureDirectories()
+        try LauncherWriter.writeLaunchers()
+        let (existing, _) = try readSettings()
+        let backup = try makeBackup()
+
+        var settings = existing
+        var hooks = settings["hooks"] as? [String: Any] ?? [:]
+        let desired = desiredGroups()
+        for (event, value) in hooks {
+            guard let groups = value as? [[String: Any]] else { continue }
+            let remaining = groups.compactMap { groupWithoutMarker($0) }
+            if remaining.isEmpty, desired[event] == nil {
+                hooks.removeValue(forKey: event)
+            } else {
+                hooks[event] = remaining
+            }
+        }
+        for (event, groups) in desired {
+            hooks[event] = (hooks[event] as? [[String: Any]] ?? []) + groups
+        }
+        settings["hooks"] = hooks
+        try writeAtomically(settings, to: Paths.claudeSettings)
+        return backup
     }
 
     private func groupCarriesMarker(_ group: [String: Any]) -> Bool {

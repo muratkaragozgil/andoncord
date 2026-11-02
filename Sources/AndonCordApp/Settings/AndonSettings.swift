@@ -17,6 +17,9 @@ final class AndonSettings {
         static let quietWhileFocused = "quietWhileFocused"
         static let migratedAlwaysVisiblePill = "migratedAlwaysVisiblePill"
         static let exactUsage = "exactUsageFromAnthropic"
+        static let globalShortcuts = "globalShortcuts"
+        static let hideInFullscreen = "hideInFullscreen"
+        static let quietWhenSessionInFront = "quietWhenSessionInFront"
     }
 
     private let defaults: UserDefaults
@@ -35,6 +38,9 @@ final class AndonSettings {
             Key.hasCompletedOnboarding: false,
             Key.quietWhileFocused: true,
             Key.exactUsage: false,
+            Key.globalShortcuts: true,
+            Key.hideInFullscreen: true,
+            Key.quietWhenSessionInFront: true,
         ])
 
         // One-time migration for installs that predate the new default. A
@@ -107,6 +113,28 @@ final class AndonSettings {
     var quietWhileFocused: Bool {
         get { defaults.bool(forKey: Key.quietWhileFocused) }
         set { defaults.set(newValue, forKey: Key.quietWhileFocused) }
+    }
+
+    /// ⌃⌥Y / ⌃⌥N / ⌃⌥A / ⌃⌥B from any app. On by default: the card's own
+    /// ⌘Y / ⌘N only reach a panel that has keyboard focus, which a panel that
+    /// never steals focus almost never has.
+    var globalShortcuts: Bool {
+        get { defaults.bool(forKey: Key.globalShortcuts) }
+        set { defaults.set(newValue, forKey: Key.globalShortcuts) }
+    }
+
+    /// Get out of the way of a fullscreen app on the board's display — a
+    /// video, a presentation, a game. A shortcut still brings it up.
+    var hideInFullscreen: Bool {
+        get { defaults.bool(forKey: Key.hideInFullscreen) }
+        set { defaults.set(newValue, forKey: Key.hideInFullscreen) }
+    }
+
+    /// No chime and no pop-open for a session whose own app is in front:
+    /// its terminal or the Claude app is already showing the same prompt.
+    var quietWhenSessionInFront: Bool {
+        get { defaults.bool(forKey: Key.quietWhenSessionInFront) }
+        set { defaults.set(newValue, forKey: Key.quietWhenSessionInFront) }
     }
 
     var hasCompletedOnboarding: Bool {

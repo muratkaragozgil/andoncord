@@ -21,13 +21,20 @@ struct RequestCardView: View {
 
             switch tool.kind {
             case .question(let detail):
-                QuestionBody(detail: detail) { answer in
-                    app.board.answerQuestion(request, answer: answer)
+                QuestionBody(detail: detail) { answers in
+                    app.board.answerQuestion(request, answers: answers)
                 }
+                // Each request gets a fresh form; state from the last one
+                // must not leak into the next in line.
+                .id(request.id)
             case .plan(let markdown):
                 PlanBody(markdown: markdown,
-                         onApprove: { app.board.approvePlan(request) },
+                         shortcutHint: app.settings.globalShortcuts
+                            ? "\(CardShortcut.allow.label) approve · \(CardShortcut.deny.label) keep planning"
+                            : "⌘Y / ⇧⌘Y / ⌘R",
+                         onApprove: { app.board.approvePlan(request, acceptEdits: $0) },
                          onReject: { app.board.rejectPlan(request, feedback: $0) })
+                    .id(request.id)
             default:
                 PermissionBody(tool: tool, request: request, app: app)
             }
@@ -53,6 +60,15 @@ struct RequestCardView: View {
                 .font(AndonTheme.label(10))
                 .tracking(0.8)
                 .foregroundStyle(AndonTheme.amber)
+
+            if request.agentId != nil {
+                AndonChip(text: "subagent")
+                    .help("Asked by a subagent working for this session")
+            }
+            if !session.queued.isEmpty {
+                AndonChip(text: "+\(session.queued.count) waiting", color: AndonTheme.amber)
+                    .help("More requests from this session are lined up behind this one")
+            }
 
             Spacer(minLength: 4)
 
@@ -109,38 +125,56 @@ private struct PermissionBody: View {
                 .buttonStyle(AndonButtonStyle(tint: AndonTheme.green, prominent: true))
                 .keyboardShortcut("y", modifiers: .command)
 
-                // Persists an allow rule so this shape of call stops asking.
-                if let rule = alwaysAllowRule {
-                    Button("Always allow") {
-                        app.board.approve(request, alwaysRule: rule)
+                // Claude Code's own "don't ask again" options, worded and
+                // scoped exactly as its terminal dialog would offer them.
+                if let first = suggestions.first {
+                    Button(first.label) {
+                        app.board.approve(request, always: first)
                     }
                     .buttonStyle(AndonButtonStyle(tint: AndonTheme.textSecondary))
-                    .help("Adds the permission rule \(rule)")
+                    .keyboardShortcut("a", modifiers: .command)
+                    .help(first.detail)
+                    .lineLimit(1)
+
+                    if suggestions.count > 1 {
+                        Menu {
+                            ForEach(suggestions.dropFirst()) { suggestion in
+                                Button(suggestion.label) {
+                                    app.board.approve(request, always: suggestion)
+                                }
+                                .help(suggestion.detail)
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .foregroundStyle(AndonTheme.textSecondary)
+                        .help("Other ways to stop asking")
+                    }
                 }
 
                 Spacer(minLength: 0)
 
-                Text("⌘Y / ⌘N")
+                Text(shortcutHint)
                     .font(AndonTheme.numeric(9))
                     .foregroundStyle(AndonTheme.textTertiary)
             }
         }
     }
 
-    /// A permission rule matching the whole tool, which is the only
-    /// generalisation safe to offer without guessing at argument shapes.
-    private var alwaysAllowRule: String? {
-        switch tool.kind {
-        case .shell:
-            // Bash rules are argument-sensitive; blanket-allowing every shell
-            // command from one click is not a choice to make casually, so it
-            // is deliberately not offered here.
-            return nil
-        case .edit, .write, .read, .search:
-            return request.toolName
-        default:
-            return request.toolName
-        }
+    private var suggestions: [PermissionSuggestion] {
+        PermissionSuggestion.from(request.suggestions)
+    }
+
+    /// The shortcuts that reach this card from wherever the person is. The
+    /// ⌘ ones only work once the panel has been clicked.
+    private var shortcutHint: String {
+        let global = app.settings.globalShortcuts
+        let keys = suggestions.isEmpty
+            ? [CardShortcut.allow, .deny] : [CardShortcut.allow, .alwaysAllow, .deny]
+        return keys.map { global ? $0.label : "⌘\($0.key)" }.joined(separator: " / ")
     }
 
     @ViewBuilder
@@ -264,65 +298,83 @@ private struct CodeBlock: View {
 
 // MARK: - Question
 
+/// Every question of an `AskUserQuestion` call, answered as one set.
+///
+/// A single plain question keeps the old one-click flow — picking an option
+/// is the answer, as in the terminal. Several questions, or a multi-select,
+/// collect choices first and send them together, because the tool runs once
+/// with all of its answers.
 private struct QuestionBody: View {
     let detail: ToolPresentation.QuestionDetail
-    let onAnswer: (String) -> Void
+    let onAnswer: ([String: [String]]) -> Void
 
-    @State private var freeform = ""
+    /// Labels picked per question, by question text.
+    @State private var picked: [String: Set<String>] = [:]
+    /// Typed answers per question, by question text.
+    @State private var typed: [String: String] = [:]
+
+    private var answersOnClick: Bool {
+        detail.questions.count == 1
+            && !detail.questions[0].multiSelect
+            && !detail.questions[0].options.isEmpty
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(detail.question)
+        VStack(alignment: .leading, spacing: 11) {
+            if let title = detail.title, !title.isEmpty {
+                Text(title)
+                    .font(AndonTheme.body(12, weight: .semibold))
+                    .foregroundStyle(AndonTheme.textPrimary)
+            }
+
+            ForEach(Array(detail.questions.enumerated()), id: \.element.id) { index, question in
+                questionView(question, isFirst: index == 0)
+            }
+
+            if !answersOnClick {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Text("\(answeredCount) of \(detail.questions.count) answered")
+                        .font(AndonTheme.numeric(9))
+                        .foregroundStyle(AndonTheme.textTertiary)
+                    Button("Send answers", action: submitAll)
+                        .buttonStyle(AndonButtonStyle(tint: AndonTheme.accent, prominent: true))
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(answeredCount == 0)
+                }
+            }
+        }
+    }
+
+    private func questionView(_ question: ToolPresentation.Question, isFirst: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if question.header?.isEmpty == false || question.multiSelect {
+                HStack(spacing: 5) {
+                    if let header = question.header, !header.isEmpty { AndonChip(text: header) }
+                    if question.multiSelect { AndonChip(text: "pick any", color: AndonTheme.accent) }
+                }
+            }
+
+            Text(question.question)
                 .font(AndonTheme.body(12, weight: .medium))
                 .foregroundStyle(AndonTheme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            VStack(spacing: 5) {
-                ForEach(Array(detail.options.enumerated()), id: \.element.id) { index, option in
-                    Button {
-                        onAnswer(option.label)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text("\(index + 1)")
-                                .font(AndonTheme.numeric(9, weight: .bold))
-                                .foregroundStyle(AndonTheme.textTertiary)
-                                .frame(width: 12)
-
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(option.label)
-                                    .font(AndonTheme.body(12, weight: .medium))
-                                    .foregroundStyle(AndonTheme.textPrimary)
-                                if let description = option.description {
-                                    Text(description)
-                                        .font(AndonTheme.body(10))
-                                        .foregroundStyle(AndonTheme.textTertiary)
-                                        .lineLimit(2)
-                                        .multilineTextAlignment(.leading)
-                                }
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 7)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background {
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(AndonTheme.surfaceRaised)
-                        }
-                        .contentShape(Rectangle())
+            if !question.options.isEmpty {
+                VStack(spacing: 5) {
+                    ForEach(Array(question.options.enumerated()), id: \.element.id) { index, option in
+                        optionRow(option, index: index, in: question, numbered: isFirst)
                     }
-                    .buttonStyle(.plain)
-                    // Number keys mirror how the same prompt is answered in
-                    // the terminal, so the muscle memory carries over.
-                    .keyboardShortcut(
-                        KeyEquivalent(Character("\(min(index + 1, 9))")), modifiers: .command)
                 }
             }
 
             // Claude sometimes asks something the options do not cover; the
             // terminal always allows a typed answer, so this must too.
             HStack(spacing: 6) {
-                TextField("Or type an answer…", text: $freeform)
+                TextField(
+                    question.expectsTypedAnswer
+                        ? (question.placeholder ?? "Type an answer…") : "Or type an answer…",
+                    text: typedBinding(for: question))
                     .textFieldStyle(.plain)
                     .font(AndonTheme.body(11))
                     .foregroundStyle(AndonTheme.textPrimary)
@@ -332,19 +384,144 @@ private struct QuestionBody: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(AndonTheme.surface)
                     }
-                    .onSubmit(submitFreeform)
+                    .onSubmit { if answersOnClick { submitTyped(question) } }
 
-                Button("Send", action: submitFreeform)
-                    .buttonStyle(AndonButtonStyle(tint: AndonTheme.accent, prominent: true))
-                    .disabled(freeform.trimmingCharacters(in: .whitespaces).isEmpty)
+                if answersOnClick {
+                    Button("Send") { submitTyped(question) }
+                        .buttonStyle(AndonButtonStyle(tint: AndonTheme.accent, prominent: true))
+                        .disabled(typedText(for: question).isEmpty)
+                }
             }
         }
     }
 
-    private func submitFreeform() {
-        let trimmed = freeform.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        onAnswer(trimmed)
+    private func optionRow(
+        _ option: ToolPresentation.Question.Option, index: Int,
+        in question: ToolPresentation.Question, numbered: Bool
+    ) -> some View {
+        let isPicked = picked[question.question]?.contains(option.label) == true
+        return Button {
+            choose(option, in: question)
+        } label: {
+            HStack(spacing: 8) {
+                if answersOnClick {
+                    Text("\(index + 1)")
+                        .font(AndonTheme.numeric(9, weight: .bold))
+                        .foregroundStyle(AndonTheme.textTertiary)
+                        .frame(width: 12)
+                } else {
+                    Image(systemName: question.multiSelect
+                          ? (isPicked ? "checkmark.square.fill" : "square")
+                          : (isPicked ? "largecircle.fill.circle" : "circle"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(isPicked ? AndonTheme.accent : AndonTheme.textTertiary)
+                        .frame(width: 12)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(option.label)
+                        .font(AndonTheme.body(12, weight: .medium))
+                        .foregroundStyle(AndonTheme.textPrimary)
+                    if let description = option.description {
+                        Text(description)
+                            .font(AndonTheme.body(10))
+                            .foregroundStyle(AndonTheme.textTertiary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isPicked ? AndonTheme.accent.opacity(0.16) : AndonTheme.surfaceRaised)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Number keys mirror how the same prompt is answered in the
+        // terminal, so the muscle memory carries over. Only the first
+        // question gets them; ⌘1 cannot mean two things.
+        .numberShortcut(index, enabled: numbered)
+    }
+
+    // MARK: Answers
+
+    private func choose(_ option: ToolPresentation.Question.Option, in question: ToolPresentation.Question) {
+        if answersOnClick {
+            onAnswer([question.question: [option.label]])
+            return
+        }
+        var labels = picked[question.question] ?? []
+        if question.multiSelect {
+            if labels.contains(option.label) { labels.remove(option.label) } else { labels.insert(option.label) }
+        } else {
+            labels = labels.contains(option.label) ? [] : [option.label]
+            // A pick replaces whatever was typed, as choosing does in the
+            // terminal.
+            typed[question.question] = nil
+        }
+        picked[question.question] = labels
+    }
+
+    private func typedBinding(for question: ToolPresentation.Question) -> Binding<String> {
+        Binding(
+            get: { typed[question.question] ?? "" },
+            set: { text in
+                typed[question.question] = text
+                // Typing is the "Other" answer: for a single choice it stands
+                // in for a picked option.
+                if !question.multiSelect, !text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    picked[question.question] = nil
+                }
+            })
+    }
+
+    private func typedText(for question: ToolPresentation.Question) -> String {
+        (typed[question.question] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Labels in the order the question listed them, then anything typed.
+    private func answer(for question: ToolPresentation.Question) -> [String] {
+        let chosen = question.options.map(\.label).filter { picked[question.question]?.contains($0) == true }
+        let text = typedText(for: question)
+        if text.isEmpty { return chosen }
+        return question.multiSelect ? chosen + [text] : [text]
+    }
+
+    private var answeredCount: Int {
+        detail.questions.filter { !answer(for: $0).isEmpty }.count
+    }
+
+    private func submitTyped(_ question: ToolPresentation.Question) {
+        let text = typedText(for: question)
+        guard !text.isEmpty else { return }
+        onAnswer([question.question: [text]])
+    }
+
+    private func submitAll() {
+        var answers: [String: [String]] = [:]
+        for question in detail.questions {
+            let labels = answer(for: question)
+            if !labels.isEmpty { answers[question.question] = labels }
+        }
+        guard !answers.isEmpty else { return }
+        onAnswer(answers)
+    }
+}
+
+private extension View {
+    /// ⌘1–⌘9 on the first nine options, and nothing on the rest.
+    @ViewBuilder
+    func numberShortcut(_ index: Int, enabled: Bool) -> some View {
+        if enabled, index < 9 {
+            keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+        } else {
+            self
+        }
     }
 }
 
@@ -352,7 +529,9 @@ private struct QuestionBody: View {
 
 private struct PlanBody: View {
     let markdown: String
-    let onApprove: () -> Void
+    let shortcutHint: String
+    /// `true` to also start accepting edits without asking.
+    let onApprove: (Bool) -> Void
     let onReject: (String) -> Void
 
     @State private var isWritingFeedback = false
@@ -391,18 +570,25 @@ private struct PlanBody: View {
                 }
             } else {
                 HStack(spacing: 7) {
-                    Button("Revise…") {
+                    Button("Keep planning…") {
                         isWritingFeedback = true
                     }
                     .buttonStyle(AndonButtonStyle(tint: AndonTheme.amber))
                     .keyboardShortcut("r", modifiers: .command)
 
-                    Button("Approve plan") { onApprove() }
+                    Button("Approve") { onApprove(false) }
                         .buttonStyle(AndonButtonStyle(tint: AndonTheme.green, prominent: true))
                         .keyboardShortcut("y", modifiers: .command)
+                        .help("Leave plan mode; edits still ask, as before planning")
+
+                    // The terminal's "auto-accept edits" option.
+                    Button("Approve + accept edits") { onApprove(true) }
+                        .buttonStyle(AndonButtonStyle(tint: AndonTheme.green))
+                        .keyboardShortcut("y", modifiers: [.command, .shift])
+                        .help("Leave plan mode and accept file edits without asking for the rest of the session")
 
                     Spacer(minLength: 0)
-                    Text("⌘Y / ⌘R")
+                    Text(shortcutHint)
                         .font(AndonTheme.numeric(9))
                         .foregroundStyle(AndonTheme.textTertiary)
                 }

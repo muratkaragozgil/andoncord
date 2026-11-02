@@ -84,6 +84,15 @@ public struct PendingRequest: Identifiable, Sendable, Equatable {
     public let kind: Kind
     public let toolName: String
     public let toolInput: JSONValue?
+    /// The "don't ask again" options Claude Code's own dialog offers for this
+    /// call, verbatim. Handed back unchanged when the person picks one.
+    public let suggestions: [JSONValue]
+    /// The tool call this request is about, when the `PreToolUse` before it
+    /// could be matched. It is how a request answered in the terminal is
+    /// recognised as gone: that call's result arrives with the same id.
+    public let toolUseId: String?
+    /// The subagent asking, or nil for the session's own thread.
+    public let agentId: String?
     public let createdAt: Date
 
     public init(
@@ -92,6 +101,9 @@ public struct PendingRequest: Identifiable, Sendable, Equatable {
         kind: Kind,
         toolName: String,
         toolInput: JSONValue?,
+        suggestions: [JSONValue] = [],
+        toolUseId: String? = nil,
+        agentId: String? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -99,6 +111,9 @@ public struct PendingRequest: Identifiable, Sendable, Equatable {
         self.kind = kind
         self.toolName = toolName
         self.toolInput = toolInput
+        self.suggestions = suggestions
+        self.toolUseId = toolUseId
+        self.agentId = agentId
         self.createdAt = createdAt
     }
 
@@ -108,6 +123,22 @@ public struct PendingRequest: Identifiable, Sendable, Equatable {
         case .question: return .question
         case .plan: return .plan
         }
+    }
+}
+
+/// An MCP server's request for input, as far as the board needs it.
+public struct ElicitationNotice: Sendable, Equatable {
+    public let server: String
+    public let message: String
+    /// For a sign-in: the page the server wants opened.
+    public let url: String?
+    public let id: String?
+
+    public init(server: String, message: String, url: String?, id: String?) {
+        self.server = server
+        self.message = message
+        self.url = url
+        self.id = id
     }
 }
 
@@ -135,7 +166,17 @@ public struct Session: Identifiable, Sendable {
     /// Rolling tail of recent tool calls for the expanded row.
     public var recentActivity: [ActivityEntry]
 
+    /// The request on the card. Others that arrived while it was up wait in
+    /// `queued`, in order — parallel subagents ask at once, and each of them
+    /// is a process blocked until someone answers.
     public var pending: PendingRequest?
+    public var queued: [PendingRequest] = []
+    /// An MCP server waiting on the person in Claude's own form. Shown, not
+    /// answered: Claude Code holds its form back until elicitation hooks
+    /// return, so this hook never waits.
+    public var elicitation: ElicitationNotice?
+    /// The model's effort setting, when it has one (`high`, `xhigh`, …).
+    public var effortLevel: String?
     /// Subagent ids currently running under this session.
     public var activeSubagents: Set<String>
 
@@ -192,6 +233,24 @@ public struct Session: Identifiable, Sendable {
         self.recentActivity = recentActivity
         self.pending = pending
         self.activeSubagents = activeSubagents
+    }
+
+    /// Every request waiting on a person, the one on the card first.
+    public var waitingRequests: [PendingRequest] {
+        (pending.map { [$0] } ?? []) + queued
+    }
+
+    /// Take a request off the board wherever it is in the line, moving the
+    /// next one up when it was the one on the card.
+    @discardableResult
+    public mutating func removeRequest(id: UUID) -> PendingRequest? {
+        if pending?.id == id {
+            let removed = pending
+            pending = queued.isEmpty ? nil : queued.removeFirst()
+            return removed
+        }
+        guard let index = queued.firstIndex(where: { $0.id == id }) else { return nil }
+        return queued.remove(at: index)
     }
 
     /// Folder name of `cwd`, which is what people actually recognise a

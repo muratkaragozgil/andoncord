@@ -218,24 +218,81 @@ final class InstallerTests: XCTestCase {
                       "paths should stay home-relative rather than absolute")
     }
 
-    func testInterceptedToolsGetTheirOwnBlockingGroup() throws {
+    /// A blocking `PreToolUse` hook holds back Claude Code's own dialog until
+    /// it returns. Questions and plans are answered through
+    /// `PermissionRequest`, which runs beside that dialog instead.
+    func testNothingBlocksInPreToolUse() throws {
         try writeSettings("{}")
         try ClaudeSettingsInstaller().install()
 
         let hooks = try readSettings()["hooks"] as! [String: Any]
         let groups = hooks["PreToolUse"] as! [[String: Any]]
+        XCTAssertEqual(groups.count, 1)
+        let handler = (groups[0]["hooks"] as! [[String: Any]])[0]
+        XCTAssertNil(handler["timeout"], "the hot path must not be configured as blocking")
+        XCTAssertFalse((handler["command"] as! String).contains("--blocking"))
 
-        let wildcard = groups.first { $0["matcher"] as? String == "*" }
-        let intercepted = groups.first {
-            ($0["matcher"] as? String) == InterceptedTool.matcherPattern
+        let permission = (hooks["PermissionRequest"] as! [[String: Any]])[0]
+        XCTAssertEqual(permission["matcher"] as? String, "*",
+                       "questions and plans arrive here, so it must match every tool")
+        XCTAssertNotNil(hooks["PermissionDenied"])
+    }
+
+    /// What 0.2 wrote: the same hooks plus a blocking `PreToolUse` group for
+    /// the two tools it answered by denying them.
+    private func writeLegacyInstall() throws {
+        let passive = ClaudeSettingsInstaller.command()
+        let blocking = ClaudeSettingsInstaller.command(arguments: "--blocking")
+        func group(_ command: String, matcher: String? = nil, timeout: Bool = false) -> String {
+            let handler = timeout
+                ? #"{"type":"command","command":\#(json(command)),"timeout":86400}"#
+                : #"{"type":"command","command":\#(json(command))}"#
+            return matcher.map { #"{"matcher":"\#($0)","hooks":[\#(handler)]}"# }
+                ?? #"{"hooks":[\#(handler)]}"#
         }
-        XCTAssertNotNil(wildcard, "activity stream should stay non-blocking")
-        XCTAssertNotNil(intercepted)
+        try writeSettings("""
+        {
+          "hooks": {
+            "PreToolUse": [\(group(passive, matcher: "*")),
+                           \(group(blocking, matcher: "ExitPlanMode|AskUserQuestion", timeout: true)),
+                           {"matcher":"Bash","hooks":[{"type":"command","command":"other-tool check"}]}],
+            "PermissionRequest": [\(group(blocking, matcher: "*", timeout: true))],
+            "Stop": [\(group(passive))]
+          },
+          "statusLine": {"type":"command","command":"/Users/x/.andoncord/bin/andon-statusline"}
+        }
+        """)
+    }
 
-        let wildcardHandler = (wildcard!["hooks"] as! [[String: Any]])[0]
-        XCTAssertNil(wildcardHandler["timeout"],
-                     "the hot path must not be configured as blocking")
-        XCTAssertFalse((wildcardHandler["command"] as! String).contains("--blocking"))
+    private func json(_ string: String) -> String {
+        String(decoding: try! JSONEncoder().encode(string), as: UTF8.self)
+    }
+
+    func testAnOlderInstallIsUpgradedWithoutTouchingAnythingElse() throws {
+        try writeLegacyInstall()
+        let installer = ClaudeSettingsInstaller()
+        XCTAssertTrue(installer.hooksNeedUpgrade)
+
+        try installer.upgradeHooks()
+
+        XCTAssertFalse(installer.hooksNeedUpgrade)
+        XCTAssertEqual(installer.currentStatus(), .installed)
+        let settings = try readSettings()
+        let preToolUse = (settings["hooks"] as! [String: Any])["PreToolUse"] as! [[String: Any]]
+        let commands = preToolUse.flatMap { ($0["hooks"] as! [[String: Any]]).map { $0["command"] as! String } }
+        XCTAssertEqual(commands.filter { $0.contains("--blocking") }.count, 0)
+        XCTAssertEqual(commands.filter { $0 == "other-tool check" }.count, 1,
+                       "another tool's hook must survive the upgrade")
+        XCTAssertEqual((settings["statusLine"] as? [String: Any])?["command"] as? String,
+                       "/Users/x/.andoncord/bin/andon-statusline")
+    }
+
+    func testCommentsAreNotDroppedBehindSomeonesBack() throws {
+        try writeLegacyInstall()
+        let text = try String(contentsOf: Paths.claudeSettings, encoding: .utf8)
+        try writeSettings("// keep this note\n" + text)
+        XCTAssertFalse(ClaudeSettingsInstaller().hooksNeedUpgrade,
+                       "a rewrite would drop the comment, so it waits for Repair")
     }
 }
 

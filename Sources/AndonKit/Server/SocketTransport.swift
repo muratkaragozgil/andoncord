@@ -98,7 +98,20 @@ public enum SocketTransport {
             close(fd)
             throw TransportError.listenFailed(saved)
         }
+        // Non-blocking, so the accept loop can drain the backlog and return.
+        // Blocking, its last accept() never came back: one thread parked for
+        // the life of the app, and a cancelled source that could not run its
+        // cancel handler to close this descriptor.
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         return fd
+    }
+
+    /// Put a descriptor back into blocking mode. On Darwin an accepted socket
+    /// inherits the listener's O_NONBLOCK, and the client IO relies on
+    /// SO_RCVTIMEO-bounded blocking reads.
+    static func makeBlocking(_ fd: Int32) {
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0, flags & O_NONBLOCK != 0 { _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) }
     }
 
     // MARK: - Framed IO

@@ -110,6 +110,9 @@ final class RoundTripTests: XCTestCase {
         // Terminal identity is only observable from the shim's own process.
         XCTAssertEqual(session.terminal?.kind, .iTerm2)
         XCTAssertEqual(session.terminal?.tmuxPane, "%7")
+        // Launched straight from this process, so this process is the host —
+        // the stand-in for Claude Code, whose liveness the reaper checks.
+        XCTAssertEqual(session.terminal?.hostPid, getpid())
 
         XCTAssertTrue(process.isRunning, "the hook must still be blocking Claude Code")
 
@@ -124,6 +127,35 @@ final class RoundTripTests: XCTestCase {
             try? JSONDecoder().decode(HookResponse.self, from: Data(output.utf8)),
             "shim stdout was not a decision: \(output)")
         XCTAssertEqual(decoded.hookSpecificOutput?.decision?.behavior, "allow")
+    }
+
+    /// Claude Code kills the hook when the turn is interrupted or the session
+    /// dies. The card must go with it, rather than sit there answering
+    /// nothing until somebody clicks it.
+    @MainActor
+    func testKilledHookTakesItsCardWithIt() async throws {
+        let board = BoardStore()
+        server = HookServer()
+        server.onEvent = { envelope, decision in
+            MainActor.assumeIsolated { board.apply(envelope, decision: decision) }
+        }
+        server.onWithdrawn = { id in
+            MainActor.assumeIsolated { board.withdraw(decisionId: id) }
+        }
+        try server.start()
+
+        let payload = """
+        {"session_id":"rt-3","hook_event_name":"PermissionRequest","tool_name":"Bash",\
+        "tool_input":{"command":"make deploy"}}
+        """
+        let (process, _) = try launchHook(payload: payload, blocking: true)
+        try await waitUntil("request parked") { board.session(id: "rt-3")?.pending != nil }
+
+        kill(process.processIdentifier, SIGKILL)
+        process.waitUntilExit()
+
+        try await waitUntil("card withdrawn") { board.session(id: "rt-3")?.pending == nil }
+        XCTAssertEqual(board.session(id: "rt-3")?.state, .idle)
     }
 
     @MainActor
